@@ -40,6 +40,22 @@ docker compose up --build
 
 Контейнер запускается в dev-режиме с авто-перезапуском при изменении файлов.
 
+## Автодеплой на macmini (GitHub Actions + self-hosted runner)
+
+В репозитории есть workflow: `.github/workflows/deploy-macmini.yml`.
+Он запускается на self-hosted runner с метками `macmini` и `vkusvillbot` при каждом push в `main`.
+
+Шаги на сервере macmini (один раз):
+1. В GitHub репо: Settings → Actions → Runners → New self-hosted runner.
+2. Скачайте runner на macmini и зарегистрируйте его с метками `macmini,vkusvillbot`.
+3. Убедитесь, что runner запущен как сервис и у пользователя есть доступ к Docker.
+4. Репозиторий должен быть развёрнут в `/Users/macmini/dev-server/vkusvillbot` и содержать `.env`.
+
+Workflow вызывает скрипт `scripts/deploy_macmini.sh`, который:
+- делает `git fetch/reset` на `origin/main`;
+- чистит рабочую директорию, сохраняя `.env`, `data/`, `logs/`;
+- перезапускает контейнер: `docker compose up -d --build`.
+
 ## Конфигурация
 
 - `.env` — секреты:
