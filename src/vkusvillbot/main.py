@@ -12,7 +12,7 @@ from vkusvillbot.config import Settings
 from vkusvillbot.db import Database
 from vkusvillbot.formatting import to_telegram_markdown
 from vkusvillbot.llm_client import OpenRouterClient
-from vkusvillbot.logging import setup_logging
+from vkusvillbot.logging import setup_dialog_logger, setup_logging
 from vkusvillbot.mcp_client import MCPError, VkusvillMCP
 from vkusvillbot.models import UserProfile
 from vkusvillbot.sgr_agent import SgrAgent, SgrConfig
@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 async def main() -> None:
     settings = Settings.load()
     setup_logging(settings.app.log_level)
+    dialog_logger = setup_dialog_logger()
 
     if not settings.telegram.token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
@@ -87,10 +88,15 @@ async def main() -> None:
     async def on_text(message: Message) -> None:
         user = db.get_or_create_user(message.from_user.id)
         profile = UserProfile(city=user.city, diet_notes=user.diet_notes)
-        agent = SgrAgent(mcp=mcp, llm=llm, config=sgr_config, profile=profile)
+        agent = SgrAgent(mcp=mcp, llm=llm, db=db, config=sgr_config, profile=profile)
         text = message.text or ""
         try:
-            reply = await agent.run(text)
+            dialog_logger.info("USER tg_id=%s user_id=%s: %s", message.from_user.id, user.id, text)
+            history = db.get_recent_messages(user.id, limit=settings.sgr.history_messages)
+            reply = await agent.run(text, history=history, user_id=user.id)
+            db.save_message(user.id, "user", text)
+            db.save_message(user.id, "assistant", reply)
+            dialog_logger.info("ASSISTANT user_id=%s: %s", user.id, reply)
             db.save_session(user.id, "sgr", {"query": text})
             reply_md = to_telegram_markdown(reply)
             await message.answer(

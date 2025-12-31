@@ -40,6 +40,9 @@ class SgrConfig(BaseModel):
     max_steps: int = 8
     max_items_per_search: int = 10
     temperature: float = 0.4
+    history_messages: int = 8
+    local_fresh_hours: int = 24
+    use_mcp_refresh: bool = True
 
 
 class Settings(BaseModel):

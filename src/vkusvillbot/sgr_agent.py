@@ -8,11 +8,13 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ValidationError
 
+from vkusvillbot.db import Database
 from vkusvillbot.mcp_client import MCPError, VkusvillMCP
 from vkusvillbot.models import UserProfile
 from vkusvillbot.prompts import build_system_prompt
 
 logger = logging.getLogger(__name__)
+dialog_logger = logging.getLogger("dialog")
 
 
 class LLMClient(Protocol):
@@ -109,6 +111,9 @@ class SgrConfig:
     max_steps: int = 8
     max_items_per_search: int = 10
     temperature: float = 0.4
+    history_messages: int = 8
+    local_fresh_hours: int = 24
+    use_mcp_refresh: bool = True
 
 
 class SgrAgent:
@@ -116,23 +121,35 @@ class SgrAgent:
         self,
         mcp: VkusvillMCP,
         llm: LLMClient,
+        db: Database,
         config: SgrConfig,
         profile: UserProfile,
     ) -> None:
         self.mcp = mcp
         self.llm = llm
+        self.db = db
         self.config = config
         self.profile = profile
+        self._mcp_search_cache: set[str] = set()
 
-    async def run(self, user_text: str) -> str:
+    async def run(
+        self,
+        user_text: str,
+        history: list[dict[str, str]] | None = None,
+        user_id: int | None = None,
+    ) -> str:
         system_prompt = build_system_prompt(self.profile)
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text},
         ]
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": user_text})
 
         for step in range(self.config.max_steps):
             llm_text = await self.llm.chat(messages, temperature=self.config.temperature)
+            if user_id is not None:
+                dialog_logger.info("LLM_RAW user_id=%s step=%s: %s", user_id, step, llm_text)
             try:
                 parsed = parse_llm_output(llm_text)
             except (ValueError, ValidationError) as exc:
@@ -171,11 +188,60 @@ class SgrAgent:
             args = parsed.args
             try:
                 if tool == "vkusvill_products_search":
-                    data = await self.mcp.search(args.get("q", ""), int(args.get("page", 1)))
-                    compact = compact_search(data, self.config.max_items_per_search)
+                    query = str(args.get("q", "") or "")
+                    page = int(args.get("page", 1))
+                    limit = self.config.max_items_per_search
+                    offset = max(0, (page - 1) * limit)
+
+                    local_items = self.db.search_products(query, limit=limit, offset=offset)
+                    needs_mcp = self.config.use_mcp_refresh and query not in self._mcp_search_cache
+                    mcp_items: list[dict[str, Any]] = []
+                    mcp_meta: dict[str, Any] | None = None
+                    if needs_mcp:
+                        data = await self.mcp.search(query, page)
+                        mcp_items = data.get("data", {}).get("items", []) if data else []
+                        mcp_meta = data.get("data", {}).get("meta")
+                        self.db.upsert_products_from_mcp(mcp_items)
+                        self._mcp_search_cache.add(query)
+
+                    merged_items = _merge_items(local_items, mcp_items, limit)
+                    compact = {
+                        "ok": True,
+                        "data": {
+                            "items": merged_items,
+                            "meta": mcp_meta,
+                            "source": "hybrid" if mcp_items else "local",
+                        },
+                    }
                 elif tool == "vkusvill_product_details":
-                    data = await self.mcp.details(int(args.get("id")))
-                    compact = compact_details(data)
+                    product_id = int(args.get("id"))
+                    local_details = self.db.get_product_details(product_id)
+                    needs_details = True
+                    if local_details:
+                        updated_at = (
+                            local_details.get("updated_at")
+                            if isinstance(local_details, dict)
+                            else None
+                        )
+                        needs_details = self.db.is_stale(
+                            str(updated_at) if updated_at else None,
+                            self.config.local_fresh_hours,
+                        )
+                        if not local_details.get("properties"):
+                            needs_details = True
+                    if self.config.use_mcp_refresh and needs_details:
+                        data = await self.mcp.details(product_id)
+                        details = data.get("data", {}) if data else {}
+                        self.db.update_product_details_from_mcp(details)
+                        local_details = self.db.get_product_details(product_id)
+                    if local_details:
+                        compact = {
+                            "ok": True,
+                            "data": _strip_internal_fields(local_details),
+                        }
+                    else:
+                        data = await self.mcp.details(product_id)
+                        compact = compact_details(data)
                 elif tool == "vkusvill_cart_link_create":
                     data = await self.mcp.cart(args.get("products", []))
                     compact = {"ok": data.get("ok"), "data": data.get("data")}
@@ -198,3 +264,56 @@ class SgrAgent:
                 continue
 
         return "Не успел завершить запрос. Попробуйте уточнить или повторить."
+
+
+def _normalize_weight(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        weight_val = value.get("value") or value.get("weight")
+        unit = value.get("unit")
+        if weight_val is None:
+            return str(unit) if unit else None
+        return f"{weight_val} {unit}".strip() if unit else str(weight_val)
+    return str(value)
+
+
+def _mcp_item_to_compact(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": item.get("id"),
+        "xml_id": item.get("xml_id"),
+        "name": item.get("name"),
+        "price": item.get("price") or item.get("price_current"),
+        "rating": item.get("rating") or item.get("rating_avg"),
+        "unit": item.get("unit"),
+        "weight": _normalize_weight(item.get("weight")),
+        "url": item.get("url"),
+        "category": item.get("category"),
+    }
+
+
+def _strip_internal_fields(item: dict[str, Any]) -> dict[str, Any]:
+    clean = dict(item)
+    clean.pop("updated_at", None)
+    return clean
+
+
+def _merge_items(
+    local_items: list[dict[str, Any]],
+    mcp_items: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    merged: dict[int, dict[str, Any]] = {}
+    for item in mcp_items:
+        compact = _mcp_item_to_compact(item)
+        if compact.get("id") is None:
+            continue
+        merged[int(compact["id"])] = compact
+    for item in local_items:
+        if item.get("id") is None:
+            continue
+        pid = int(item["id"])
+        if pid not in merged:
+            merged[pid] = _strip_internal_fields(item)
+    result = list(merged.values())
+    return result[:limit]

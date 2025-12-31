@@ -16,3 +16,6 @@ sgr:
   max_steps: 8
   max_items_per_search: 10
   temperature: 0.4
+  history_messages: 10
+  local_fresh_hours: 24
+  use_mcp_refresh: true
