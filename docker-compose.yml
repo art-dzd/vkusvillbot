@@ -11,4 +11,13 @@ services:
       - ./:/app
       - ../vkusvill.db:/app/data/vkusvill.db
     working_dir: /app
-    command: ["watchfiles", "--filter", "python", "python", "-m", "vkusvillbot.main"]
+    command:
+      [
+        "watchfiles",
+        "--filter",
+        "python",
+        "--target-type",
+        "command",
+        "python -m vkusvillbot.main",
+        "/app",
+      ]
