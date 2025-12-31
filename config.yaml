@@ -1,0 +1,18 @@
+app:
+  log_level: INFO
+telegram:
+  bot_username: vkusvillaibot
+mcp:
+  url: https://mcp001.vkusvill.ru/mcp
+db:
+  path: ../vkusvill.db
+llm:
+  provider: openrouter
+  model: qwen/qwen3-235b-a22b-2507
+  http_referer: https://omc.ru
+  title: Оценка рекрутеров
+  provider_order: wandb/bf16,deepinfra/fp8,friendli
+sgr:
+  max_steps: 8
+  max_items_per_search: 10
+  temperature: 0.4
