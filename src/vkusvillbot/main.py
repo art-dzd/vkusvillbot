@@ -404,12 +404,19 @@ async def main() -> None:
         text = message.text or ""
         try:
             dialog_logger.info(
-                "USER tg_id=%s user_id=%s thread_key=%s thread_id=%s dm_topic_id=%s: %s",
+                (
+                    "USER tg_id=%s user_id=%s chat_id=%s msg_id=%s reply_to=%s "
+                    "thread_key=%s thread_id=%s dm_topic_id=%s routing=%s: %s"
+                ),
                 message.from_user.id,
                 user.id,
+                message.chat.id,
+                message.message_id,
+                getattr(getattr(message, "reply_to_message", None), "message_id", None),
                 thread_key,
                 message.message_thread_id,
                 getattr(getattr(message, "direct_messages_topic", None), "topic_id", None),
+                reply_kwargs,
                 text,
             )
             history = db.get_recent_messages(
@@ -424,11 +431,15 @@ async def main() -> None:
             db.save_message(user.id, "user", text, thread_id=thread_key)
             db.save_message(user.id, "assistant", reply, thread_id=thread_key)
             dialog_logger.info(
-                "ASSISTANT user_id=%s thread_key=%s thread_id=%s dm_topic_id=%s: %s",
+                (
+                    "ASSISTANT user_id=%s thread_key=%s thread_id=%s dm_topic_id=%s "
+                    "routing=%s: %s"
+                ),
                 user.id,
                 thread_key,
                 message.message_thread_id,
                 getattr(getattr(message, "direct_messages_topic", None), "topic_id", None),
+                reply_kwargs,
                 reply,
             )
             db.save_session(user.id, "sgr", {"query": text})
