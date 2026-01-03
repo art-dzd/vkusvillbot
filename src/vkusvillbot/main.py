@@ -275,6 +275,7 @@ async def main() -> None:
 
     @dp.message(F.text)
     async def on_text(message: Message) -> None:
+        thread_id = message.message_thread_id
         use_drafts = bool(settings.telegram.enable_drafts and topics_enabled)
         draft: DraftProgress | None = None
         if use_drafts:
@@ -282,7 +283,7 @@ async def main() -> None:
                 api=tg_api,
                 chat_id=cast(int, message.chat.id),
                 draft_id=cast(int, message.message_id),
-                message_thread_id=message.message_thread_id,
+                message_thread_id=thread_id,
                 enabled=bool(settings.telegram.show_progress),
             )
             try:
@@ -300,7 +301,7 @@ async def main() -> None:
             placeholder = await message.answer(
                 "Думаю…",
                 disable_web_page_preview=True,
-                direct_messages_topic_id=message.message_thread_id,
+                message_thread_id=thread_id,
             )
             fallback_progress = MessageProgress(
                 placeholder,
@@ -312,7 +313,7 @@ async def main() -> None:
                     bot,
                     message.chat.id,
                     stop_typing,
-                    message_thread_id=message.message_thread_id,
+                    message_thread_id=thread_id,
                 )
             )
 
@@ -350,14 +351,14 @@ async def main() -> None:
                     await message.answer(
                         "Ответ слишком длинный — отправляю частями.",
                         disable_web_page_preview=True,
-                        direct_messages_topic_id=message.message_thread_id,
+                        message_thread_id=thread_id,
                     )
                 for part_md in parts_md:
                     await message.answer(
                         part_md,
                         parse_mode=ParseMode.MARKDOWN_V2,
                         disable_web_page_preview=True,
-                        direct_messages_topic_id=message.message_thread_id,
+                        message_thread_id=thread_id,
                     )
             except TelegramBadRequest:
                 # На всякий случай: если MarkdownV2 не отправился (лимиты/парсинг),
@@ -366,7 +367,7 @@ async def main() -> None:
                     await message.answer(
                         part,
                         disable_web_page_preview=True,
-                        direct_messages_topic_id=message.message_thread_id,
+                        message_thread_id=thread_id,
                     )
 
             if placeholder:
@@ -379,7 +380,7 @@ async def main() -> None:
             else:
                 await message.answer(
                     f"Ошибка MCP: {exc}",
-                    direct_messages_topic_id=message.message_thread_id,
+                    message_thread_id=thread_id,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unhandled error")
@@ -388,7 +389,7 @@ async def main() -> None:
             else:
                 await message.answer(
                     f"Ошибка: {exc}",
-                    direct_messages_topic_id=message.message_thread_id,
+                    message_thread_id=thread_id,
                 )
         finally:
             stop_typing.set()
