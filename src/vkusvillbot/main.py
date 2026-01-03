@@ -343,15 +343,25 @@ async def main() -> None:
         )
         text = message.text or ""
         try:
-            dialog_logger.info("USER tg_id=%s user_id=%s: %s", message.from_user.id, user.id, text)
-            history = db.get_recent_messages(user.id, limit=settings.sgr.history_messages)
+            dialog_logger.info(
+                "USER tg_id=%s user_id=%s thread_id=%s: %s",
+                message.from_user.id,
+                user.id,
+                thread_id,
+                text,
+            )
+            history = db.get_recent_messages(
+                user.id,
+                limit=settings.sgr.history_messages,
+                thread_id=thread_id,
+            )
             progress_cb = draft.add if draft else None
             if not progress_cb and fallback_progress:
                 progress_cb = fallback_progress.add
             reply = await agent.run(text, history=history, user_id=user.id, progress=progress_cb)
-            db.save_message(user.id, "user", text)
-            db.save_message(user.id, "assistant", reply)
-            dialog_logger.info("ASSISTANT user_id=%s: %s", user.id, reply)
+            db.save_message(user.id, "user", text, thread_id=thread_id)
+            db.save_message(user.id, "assistant", reply, thread_id=thread_id)
+            dialog_logger.info("ASSISTANT user_id=%s thread_id=%s: %s", user.id, thread_id, reply)
             db.save_session(user.id, "sgr", {"query": text})
 
             if draft:

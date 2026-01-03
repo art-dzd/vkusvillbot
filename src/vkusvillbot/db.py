@@ -86,6 +86,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS messages (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               user_id INTEGER NOT NULL,
+              thread_id INTEGER,
               role TEXT NOT NULL,
               content TEXT NOT NULL,
               created_at TEXT DEFAULT (datetime('now')),
@@ -107,7 +108,23 @@ class Database:
               ON product_embeddings(embedding_model);
             """
         )
+        self._ensure_column("messages", "thread_id", "INTEGER")
+        self.conn.execute(
+            (
+                "CREATE INDEX IF NOT EXISTS idx_messages_user_thread_id "
+                "ON messages(user_id, thread_id, id)"
+            )
+        )
         self.conn.commit()
+
+    def _ensure_column(self, table: str, column: str, col_type: str) -> None:
+        cols = {
+            row[1]
+            for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column in cols:
+            return
+        self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
 
     def ensure_fts(self) -> None:
         if not self.has_products():
@@ -239,26 +256,52 @@ class Database:
             )
         self.conn.commit()
 
-    def save_message(self, user_id: int, role: str, content: str) -> None:
+    def save_message(self, user_id: int, role: str, content: str, thread_id: int | None) -> None:
         if not content:
             return
         self.conn.execute(
-            "INSERT INTO messages (user_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-            (user_id, role, content, datetime.now(timezone.utc).isoformat(timespec="seconds")),
+            (
+                "INSERT INTO messages (user_id, thread_id, role, content, created_at) "
+                "VALUES (?, ?, ?, ?, ?)"
+            ),
+            (
+                user_id,
+                thread_id,
+                role,
+                content,
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            ),
         )
         self.conn.commit()
 
-    def get_recent_messages(self, user_id: int, limit: int = 10) -> list[dict[str, str]]:
-        rows = self.conn.execute(
-            """
-            SELECT role, content
-            FROM messages
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (user_id, limit),
-        ).fetchall()
+    def get_recent_messages(
+        self,
+        user_id: int,
+        limit: int = 10,
+        thread_id: int | None = None,
+    ) -> list[dict[str, str]]:
+        if thread_id is None:
+            rows = self.conn.execute(
+                """
+                SELECT role, content
+                FROM messages
+                WHERE user_id = ? AND thread_id IS NULL
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (user_id, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """
+                SELECT role, content
+                FROM messages
+                WHERE user_id = ? AND thread_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (user_id, thread_id, limit),
+            ).fetchall()
         history = [{"role": row["role"], "content": row["content"]} for row in rows]
         history.reverse()
         return history
