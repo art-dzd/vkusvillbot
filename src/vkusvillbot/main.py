@@ -37,17 +37,33 @@ def _split_text(text: str, limit: int = _TG_MAX_LEN) -> list[str]:
     if len(text) <= limit:
         return [text]
 
-    chunks: list[str] = []
-    current = ""
-    for line in text.splitlines(keepends=True):
-        if current and len(current) + len(line) > limit:
-            chunks.append(current)
-            current = line
-            continue
-        current += line
-    if current:
-        chunks.append(current)
-    return chunks
+    parts: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= limit:
+            parts.append(remaining)
+            break
+
+        window = remaining[:limit]
+        cut = window.rfind("\n")
+        if cut <= 0:
+            cut = window.rfind(" ")
+        if cut <= 0:
+            cut = limit
+
+        chunk = remaining[:cut]
+        # Не заканчиваем chunk на одиночный backslash (важно для MarkdownV2 escapes).
+        while chunk.endswith("\\") and len(chunk) > 1:
+            cut -= 1
+            chunk = remaining[:cut]
+
+        chunk = chunk.strip("\n")
+        if chunk:
+            parts.append(chunk)
+        remaining = remaining[cut:]
+        remaining = remaining.lstrip("\n")
+
+    return parts
 
 
 class MessageProgress:
@@ -110,10 +126,19 @@ class MessageProgress:
         self._last_sent_ts = now
 
 
-async def _typing_loop(bot: Bot, chat_id: int, stop: asyncio.Event) -> None:
+async def _typing_loop(
+    bot: Bot,
+    chat_id: int,
+    stop: asyncio.Event,
+    message_thread_id: int | None = None,
+) -> None:
     while not stop.is_set():
         with suppress(Exception):
-            await bot.send_chat_action(chat_id, ChatAction.TYPING)
+            await bot.send_chat_action(
+                chat_id,
+                ChatAction.TYPING,
+                message_thread_id=message_thread_id,
+            )
         try:
             await asyncio.wait_for(stop.wait(), timeout=4.5)
         except TimeoutError:
@@ -272,13 +297,24 @@ async def main() -> None:
         stop_typing = asyncio.Event()
         typing_task: asyncio.Task[None] | None = None
         if not use_drafts:
-            placeholder = await message.answer("Думаю…", disable_web_page_preview=True)
+            placeholder = await message.answer(
+                "Думаю…",
+                disable_web_page_preview=True,
+                direct_messages_topic_id=message.message_thread_id,
+            )
             fallback_progress = MessageProgress(
                 placeholder,
                 enabled=bool(settings.telegram.show_progress),
             )
             await fallback_progress.set("🧠 Думаю…\n(прогресс появится ниже)")
-            typing_task = asyncio.create_task(_typing_loop(bot, message.chat.id, stop_typing))
+            typing_task = asyncio.create_task(
+                _typing_loop(
+                    bot,
+                    message.chat.id,
+                    stop_typing,
+                    message_thread_id=message.message_thread_id,
+                )
+            )
 
         user = db.get_or_create_user(message.from_user.id)
         profile = UserProfile(city=user.city, diet_notes=user.diet_notes)
@@ -307,25 +343,30 @@ async def main() -> None:
                 with suppress(Exception):
                     await draft.add("✅ Готово, отправляю ответ…")
 
-            parts = _split_text(reply)
-            if len(parts) == 1:
+            try:
                 reply_md = to_telegram_markdown(reply)
-                await message.answer(
-                    reply_md,
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    disable_web_page_preview=True,
-                )
-            else:
-                await message.answer(
-                    "Ответ слишком длинный — отправляю частями.",
-                    disable_web_page_preview=True,
-                )
-                for part in parts:
-                    part_md = to_telegram_markdown(part)
+                parts_md = _split_text(reply_md)
+                if len(parts_md) > 1:
+                    await message.answer(
+                        "Ответ слишком длинный — отправляю частями.",
+                        disable_web_page_preview=True,
+                        direct_messages_topic_id=message.message_thread_id,
+                    )
+                for part_md in parts_md:
                     await message.answer(
                         part_md,
                         parse_mode=ParseMode.MARKDOWN_V2,
                         disable_web_page_preview=True,
+                        direct_messages_topic_id=message.message_thread_id,
+                    )
+            except TelegramBadRequest:
+                # На всякий случай: если MarkdownV2 не отправился (лимиты/парсинг),
+                # отправляем plain-текст частями без разметки.
+                for part in _split_text(reply):
+                    await message.answer(
+                        part,
+                        disable_web_page_preview=True,
+                        direct_messages_topic_id=message.message_thread_id,
                     )
 
             if placeholder:
@@ -336,13 +377,19 @@ async def main() -> None:
             if placeholder:
                 await placeholder.edit_text(f"Ошибка MCP: {exc}")
             else:
-                await message.answer(f"Ошибка MCP: {exc}")
+                await message.answer(
+                    f"Ошибка MCP: {exc}",
+                    direct_messages_topic_id=message.message_thread_id,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unhandled error")
             if placeholder:
                 await placeholder.edit_text(f"Ошибка: {exc}")
             else:
-                await message.answer(f"Ошибка: {exc}")
+                await message.answer(
+                    f"Ошибка: {exc}",
+                    direct_messages_topic_id=message.message_thread_id,
+                )
         finally:
             stop_typing.set()
             if typing_task:
