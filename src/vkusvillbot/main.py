@@ -31,15 +31,19 @@ logger = logging.getLogger(__name__)
 _TG_MAX_LEN = 4096
 
 
-def _topic_ctx(message: Message) -> tuple[int | None, dict[str, int]]:
+def _topic_ctx(message: Message) -> tuple[int, dict[str, int]]:
     """
     Возвращает:
-    - key: идентификатор топика для истории/контекста (thread_id или dm_topic_id)
-    - kwargs: параметры для отправки ответа в тот же топик
+    - key: идентификатор контекста (topic/thread) для истории
+    - kwargs: параметры для отправки ответа в тот же контекст
 
     Telegram имеет 2 похожих механики:
     - message_thread_id: forum topics (в т.ч. topics в личке бота)
     - direct_messages_topic_id: direct messages chat topics (отдельная механика)
+
+    Если Telegram не прислал идентификатор топика (часто бывает в первом сообщении),
+    используем "reply thread": отвечаем как reply к корневому сообщению, чтобы ответы
+    оставались внутри ветки "ответов" в клиенте.
     """
 
     if message.message_thread_id is not None:
@@ -52,7 +56,15 @@ def _topic_ctx(message: Message) -> tuple[int | None, dict[str, int]]:
         dm_tid_int = int(dm_tid)
         return dm_tid_int, {"direct_messages_topic_id": dm_tid_int}
 
-    return None, {}
+    root_id = int(message.message_id)
+    node = message.reply_to_message
+    depth = 0
+    while node is not None and depth < 8:
+        root_id = int(node.message_id)
+        node = getattr(node, "reply_to_message", None)
+        depth += 1
+
+    return root_id, {"reply_to_message_id": root_id}
 
 
 def _split_text(text: str, limit: int = _TG_MAX_LEN) -> list[str]:
@@ -261,54 +273,70 @@ async def main() -> None:
         streaming_status = (
             "включено" if (topics_enabled and settings.telegram.enable_drafts) else "выключено"
         )
-        await message.answer(
+        _, routing = _topic_ctx(message)
+        await bot.send_message(
+            message.chat.id,
             (
                 f"Привет! Я бот ВкусВилл. Город: {user.city}.\n"
                 f"Темы (forum mode) в личке: {topics_status}.\n"
                 f"Стриминг через sendMessageDraft: {streaming_status}.\n\n"
                 "Напишите запрос, например: 'молоко'."
             ),
-            message_thread_id=message.message_thread_id,
+            disable_web_page_preview=True,
+            **routing,
         )
 
     @dp.message(Command("help"))
     async def cmd_help(message: Message) -> None:
-        await message.answer(
+        _, routing = _topic_ctx(message)
+        await bot.send_message(
+            message.chat.id,
             "Команды:\n"
             "/diet — задать особенности питания\n"
             "/city — задать город\n"
             "Примеры: 'найди молоко', 'состав творога', 'собери корзину: хлеб молоко'",
-            message_thread_id=message.message_thread_id,
+            disable_web_page_preview=True,
+            **routing,
         )
 
     @dp.message(Command("diet"))
     async def cmd_diet(message: Message) -> None:
+        _, routing = _topic_ctx(message)
         text = message.text.replace("/diet", "", 1).strip()
         if not text:
-            await message.answer(
+            await bot.send_message(
+                message.chat.id,
                 "Напишите особенности питания после команды /diet",
-                message_thread_id=message.message_thread_id,
+                disable_web_page_preview=True,
+                **routing,
             )
             return
         db.update_user_diet_notes(message.from_user.id, text)
-        await message.answer(
+        await bot.send_message(
+            message.chat.id,
             "Сохранил особенности питания.",
-            message_thread_id=message.message_thread_id,
+            disable_web_page_preview=True,
+            **routing,
         )
 
     @dp.message(Command("city"))
     async def cmd_city(message: Message) -> None:
+        _, routing = _topic_ctx(message)
         text = message.text.replace("/city", "", 1).strip()
         if not text:
-            await message.answer(
+            await bot.send_message(
+                message.chat.id,
                 "Напишите город после команды /city",
-                message_thread_id=message.message_thread_id,
+                disable_web_page_preview=True,
+                **routing,
             )
             return
         db.update_user_city(message.from_user.id, text)
-        await message.answer(
+        await bot.send_message(
+            message.chat.id,
             f"Город обновлён: {text}",
-            message_thread_id=message.message_thread_id,
+            disable_web_page_preview=True,
+            **routing,
         )
 
     @dp.message(F.text)
@@ -342,22 +370,12 @@ async def main() -> None:
         stop_typing = asyncio.Event()
         typing_task: asyncio.Task[None] | None = None
         if not use_drafts:
-            # Для первого сообщения в новой беседе Telegram может не прислать thread_id,
-            # но при отправке "reply_to_message_id" клиент сам положит ответ в правильный топик.
-            placeholder_kwargs = dict(reply_kwargs)
-            if not placeholder_kwargs:
-                placeholder_kwargs["reply_to_message_id"] = message.message_id
-
-            placeholder = await message.answer(
+            placeholder = await bot.send_message(
+                message.chat.id,
                 "Думаю…",
                 disable_web_page_preview=True,
-                **placeholder_kwargs,
+                **reply_kwargs,
             )
-
-            # После ответа пытаемся определить фактический топик из отправленного сообщения.
-            if not reply_kwargs:
-                thread_key, reply_kwargs = _topic_ctx(placeholder)
-                reply_kwargs = dict(reply_kwargs)
 
             fallback_progress = MessageProgress(
                 placeholder,
@@ -394,16 +412,11 @@ async def main() -> None:
                 getattr(getattr(message, "direct_messages_topic", None), "topic_id", None),
                 text,
             )
-            history: list[dict[str, str]]
-            if thread_key is None and topics_enabled:
-                # Если включены топики, но идентификатор не известен — не тянем историю из "общего".
-                history = []
-            else:
-                history = db.get_recent_messages(
-                    user.id,
-                    limit=settings.sgr.history_messages,
-                    thread_id=thread_key,
-                )
+            history = db.get_recent_messages(
+                user.id,
+                limit=settings.sgr.history_messages,
+                thread_id=thread_key,
+            )
             progress_cb = draft.add if draft else None
             if not progress_cb and fallback_progress:
                 progress_cb = fallback_progress.add
@@ -428,13 +441,15 @@ async def main() -> None:
                 reply_md = to_telegram_markdown(reply)
                 parts_md = _split_text(reply_md)
                 if len(parts_md) > 1:
-                    await message.answer(
+                    await bot.send_message(
+                        message.chat.id,
                         "Ответ слишком длинный — отправляю частями.",
                         disable_web_page_preview=True,
                         **reply_kwargs,
                     )
                 for part_md in parts_md:
-                    await message.answer(
+                    await bot.send_message(
+                        message.chat.id,
                         part_md,
                         parse_mode=ParseMode.MARKDOWN_V2,
                         disable_web_page_preview=True,
@@ -444,7 +459,8 @@ async def main() -> None:
                 # На всякий случай: если MarkdownV2 не отправился (лимиты/парсинг),
                 # отправляем plain-текст частями без разметки.
                 for part in _split_text(reply):
-                    await message.answer(
+                    await bot.send_message(
+                        message.chat.id,
                         part,
                         disable_web_page_preview=True,
                         **reply_kwargs,
@@ -458,7 +474,8 @@ async def main() -> None:
             if placeholder:
                 await placeholder.edit_text(f"Ошибка MCP: {exc}")
             else:
-                await message.answer(
+                await bot.send_message(
+                    message.chat.id,
                     f"Ошибка MCP: {exc}",
                     **reply_kwargs,
                 )
@@ -467,7 +484,8 @@ async def main() -> None:
             if placeholder:
                 await placeholder.edit_text(f"Ошибка: {exc}")
             else:
-                await message.answer(
+                await bot.send_message(
+                    message.chat.id,
                     f"Ошибка: {exc}",
                     **reply_kwargs,
                 )
