@@ -19,15 +19,17 @@ MCP:
 3) vkusvill_cart_link_create(products: [{{xml_id: int, q: float}}])
 
 Локальная БД:
-4) local_products_search(q: string, page: int=1)
+4) local_products_search(q: string, page: int=1, categories: string?|[string]?)
 5) local_product_details(id: int)
 6) local_nutrition_query(q: string?, page: int=1, limit: int=10,
+   categories: string?|[string]?,
    min_protein: float?, max_protein: float?,
    min_fat: float?, max_fat: float?,
    min_carbs: float?, max_carbs: float?,
    min_kcal: float?, max_kcal: float?,
    sort_by: protein|fat|carbs|kcal|price|rating,
-   order: asc|desc, include_missing: bool=false)
+   order: asc|desc, include_missing: bool=false,
+   filter_expr: string? (например: "protein>=20 and fat<5 and kcal<=200"))
 
 Правила:
 - Всегда отвечай СТРОГО JSON (без текста вокруг).

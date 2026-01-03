@@ -250,7 +250,12 @@ class SgrAgent:
                     page = int(args.get("page", 1))
                     limit = self.config.max_items_per_search
                     offset = max(0, (page - 1) * limit)
-                    items = self.db.search_products(query, limit=limit, offset=offset)
+                    items = self.db.search_products(
+                        query,
+                        limit=limit,
+                        offset=offset,
+                        categories=args.get("categories"),
+                    )
                     compact = {
                         "ok": True,
                         "data": {"items": items, "source": "local"},
@@ -277,6 +282,8 @@ class SgrAgent:
                                 query=args.get("q"),
                                 page=int(args.get("page", 1)),
                                 limit=int(args.get("limit", self.config.max_items_per_search)),
+                                categories=args.get("categories"),
+                                filter_expr=args.get("filter_expr"),
                                 min_protein=_to_float(args.get("min_protein")),
                                 max_protein=_to_float(args.get("max_protein")),
                                 min_fat=_to_float(args.get("min_fat")),

@@ -209,6 +209,7 @@ class Database:
         query: str,
         limit: int = 10,
         offset: int = 0,
+        categories: list[str] | str | None = None,
     ) -> list[dict[str, object]]:
         if not self.has_products():
             return []
@@ -235,7 +236,11 @@ class Database:
             """,
             params,
         ).fetchall()
-        return [_product_row_to_item(row) for row in rows]
+        items = [_product_row_to_item(row) for row in rows]
+        cat_tokens = _normalize_category_tokens(categories)
+        if not cat_tokens:
+            return items
+        return [item for item in items if _match_categories(item.get("category"), cat_tokens)]
 
     def get_product_details(self, product_id: int) -> dict[str, object] | None:
         if not self.has_products():
@@ -259,28 +264,6 @@ class Database:
         ).fetchall() if self._table_exists("product_properties") else []
         return _product_details_from_row(row, props)
 
-    def get_top_protein(self, limit: int = 5) -> list[dict[str, object]]:
-        if not self.has_products():
-            return []
-        rows = self.conn.execute(
-            """
-            SELECT id, xml_id, name, nutrition, price_current, rating_avg,
-                   unit, weight_value, weight_unit, url, category_json, updated_at
-            FROM products
-            WHERE nutrition IS NOT NULL AND trim(nutrition) <> ''
-            """,
-        ).fetchall()
-        scored: list[dict[str, object]] = []
-        for row in rows:
-            protein = _extract_protein_per_100g(row["nutrition"])
-            if protein is None:
-                continue
-            item = _product_row_to_item(row)
-            item["protein_per_100g"] = protein
-            scored.append(item)
-        scored.sort(key=lambda item: item["protein_per_100g"], reverse=True)
-        return scored[: max(1, limit)]
-
     def nutrition_query(
         self,
         query: str | None = None,
@@ -297,6 +280,8 @@ class Database:
         sort_by: str | None = None,
         order: str = "desc",
         include_missing: bool = False,
+        categories: list[str] | str | None = None,
+        filter_expr: str | None = None,
     ) -> list[dict[str, object]]:
         if not self.has_products():
             return []
@@ -319,6 +304,8 @@ class Database:
             """,
             params,
         ).fetchall()
+        cat_tokens = _normalize_category_tokens(categories)
+        filters = _parse_filter_expr(filter_expr)
 
         def within(value: float | None, min_v: float | None, max_v: float | None) -> bool:
             if value is None:
@@ -347,6 +334,8 @@ class Database:
                 continue
 
             item = _product_row_to_item(row)
+            if cat_tokens and not _match_categories(item.get("category"), cat_tokens):
+                continue
             item.update(
                 {
                     "protein_per_100g": protein,
@@ -355,6 +344,16 @@ class Database:
                     "kcal_per_100g": kcal,
                 }
             )
+            if filters and not _apply_filters(
+                item,
+                protein=protein,
+                fat=fat,
+                carbs=carbs,
+                kcal=kcal,
+                include_missing=include_missing,
+                filters=filters,
+            ):
+                continue
             items.append(item)
 
         sort_key = (sort_by or "protein").lower()
@@ -516,6 +515,120 @@ def _extract_protein_per_100g(text: str | None) -> float | None:
         return float(match.group(1).replace(",", "."))
     except ValueError:
         return None
+
+
+def _normalize_category_tokens(categories: list[str] | str | None) -> list[str]:
+    if not categories:
+        return []
+    if isinstance(categories, str):
+        raw = re.split(r"[;,/|]", categories)
+        tokens = [part.strip().lower() for part in raw if part.strip()]
+    else:
+        tokens = [str(token).strip().lower() for token in categories if str(token).strip()]
+    return tokens
+
+
+def _parse_category_field(raw: object | None) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(item).strip().lower() for item in raw if str(item).strip()]
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(item).strip().lower() for item in parsed if str(item).strip()]
+        except json.JSONDecodeError:
+            pass
+        return [raw.strip().lower()]
+    return [str(raw).strip().lower()]
+
+
+def _match_categories(raw: object | None, tokens: list[str]) -> bool:
+    if not tokens:
+        return True
+    categories = _parse_category_field(raw)
+    if not categories:
+        return False
+    for token in tokens:
+        for category in categories:
+            if token in category:
+                return True
+    return False
+
+
+def _parse_filter_expr(expr: str | None) -> list[tuple[str, str, float]]:
+    if not expr:
+        return []
+    text = expr.lower()
+    conditions = re.split(r"\band\b|&&|,", text)
+    parsed: list[tuple[str, str, float]] = []
+    for condition in conditions:
+        condition = condition.strip()
+        if not condition:
+            continue
+        match = re.search(
+            r"(protein|fat|carbs|kcal|price|rating)\s*(<=|>=|=|<|>)\s*([0-9]+[.,]?[0-9]*)",
+            condition,
+        )
+        if not match:
+            continue
+        field, op, value = match.groups()
+        try:
+            parsed.append((field, op, float(value.replace(",", "."))))
+        except ValueError:
+            continue
+    return parsed
+
+
+def _compare(value: float, op: str, target: float) -> bool:
+    if op == ">":
+        return value > target
+    if op == ">=":
+        return value >= target
+    if op == "<":
+        return value < target
+    if op == "<=":
+        return value <= target
+    if op == "=":
+        return abs(value - target) < 1e-9
+    return False
+
+
+def _apply_filters(
+    item: dict[str, object],
+    protein: float | None,
+    fat: float | None,
+    carbs: float | None,
+    kcal: float | None,
+    include_missing: bool,
+    filters: list[tuple[str, str, float]],
+) -> bool:
+    for field, op, target in filters:
+        if field == "protein":
+            value = protein
+        elif field == "fat":
+            value = fat
+        elif field == "carbs":
+            value = carbs
+        elif field == "kcal":
+            value = kcal
+        elif field == "price":
+            value = item.get("price")
+        elif field == "rating":
+            value = item.get("rating")
+        else:
+            continue
+        if value is None:
+            if include_missing:
+                continue
+            return False
+        try:
+            if not _compare(float(value), op, target):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
 
 
 def _extract_nutrition_metrics(text: str | None) -> dict[str, float | None]:
