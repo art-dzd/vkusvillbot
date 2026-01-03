@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import suppress
 from typing import cast
 
@@ -47,6 +48,66 @@ def _split_text(text: str, limit: int = _TG_MAX_LEN) -> list[str]:
     if current:
         chunks.append(current)
     return chunks
+
+
+class MessageProgress:
+    def __init__(
+        self,
+        message: Message,
+        *,
+        enabled: bool = True,
+        min_interval_s: float = 0.9,
+        max_lines: int = 18,
+        max_chars: int = 3900,
+    ) -> None:
+        self._message = message
+        self.enabled = enabled
+        self.min_interval_s = min_interval_s
+        self.max_lines = max_lines
+        self.max_chars = max_chars
+        self._lines: list[str] = []
+        self._last_sent_ts = 0.0
+        self._last_text = ""
+
+    async def set(self, text: str) -> None:
+        if not self.enabled:
+            return
+        self._lines = [text]
+        await self.flush(force=True)
+
+    async def add(self, line: str) -> None:
+        if not self.enabled:
+            return
+        self._lines.append(line)
+        if len(self._lines) > self.max_lines:
+            self._lines = self._lines[-self.max_lines :]
+        await self.flush()
+
+    async def flush(self, *, force: bool = False) -> None:
+        if not self.enabled:
+            return
+
+        now = time.monotonic()
+        if not force and (now - self._last_sent_ts) < self.min_interval_s:
+            return
+
+        text = "\n".join(self._lines).strip()
+        if not text:
+            text = "…"
+        if len(text) > self.max_chars:
+            text = "…\n" + text[-self.max_chars + 2 :]
+
+        if text == self._last_text and not force:
+            return
+
+        try:
+            await self._message.edit_text(text[:_TG_MAX_LEN], parse_mode=None)
+        except TelegramBadRequest:
+            self.enabled = False
+            return
+
+        self._last_text = text
+        self._last_sent_ts = now
 
 
 async def _typing_loop(bot: Bot, chat_id: int, stop: asyncio.Event) -> None:
@@ -207,10 +268,16 @@ async def main() -> None:
                 use_drafts = False
 
         placeholder: Message | None = None
+        fallback_progress: MessageProgress | None = None
         stop_typing = asyncio.Event()
         typing_task: asyncio.Task[None] | None = None
         if not use_drafts:
             placeholder = await message.answer("Думаю…", disable_web_page_preview=True)
+            fallback_progress = MessageProgress(
+                placeholder,
+                enabled=bool(settings.telegram.show_progress),
+            )
+            await fallback_progress.set("🧠 Думаю…\n(прогресс появится ниже)")
             typing_task = asyncio.create_task(_typing_loop(bot, message.chat.id, stop_typing))
 
         user = db.get_or_create_user(message.from_user.id)
@@ -228,6 +295,8 @@ async def main() -> None:
             dialog_logger.info("USER tg_id=%s user_id=%s: %s", message.from_user.id, user.id, text)
             history = db.get_recent_messages(user.id, limit=settings.sgr.history_messages)
             progress_cb = draft.add if draft else None
+            if not progress_cb and fallback_progress:
+                progress_cb = fallback_progress.add
             reply = await agent.run(text, history=history, user_id=user.id, progress=progress_cb)
             db.save_message(user.id, "user", text)
             db.save_message(user.id, "assistant", reply)
@@ -258,6 +327,10 @@ async def main() -> None:
                         parse_mode=ParseMode.MARKDOWN_V2,
                         disable_web_page_preview=True,
                     )
+
+            if placeholder:
+                with suppress(TelegramBadRequest):
+                    await placeholder.edit_text("✅ Готово")
         except MCPError as exc:
             logger.exception("MCP error")
             if placeholder:
