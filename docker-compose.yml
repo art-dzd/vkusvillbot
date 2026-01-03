@@ -9,7 +9,7 @@ services:
       DB_PATH: /app/data/vkusvill.db
     volumes:
       - ./:/app
-      - ../vkusvill.db:/app/data/vkusvill.db
+      - ./data/vkusvill.db:/app/data/vkusvill.db
     working_dir: /app
     command:
       [
