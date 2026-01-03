@@ -26,6 +26,13 @@ class DBConfig(BaseModel):
     path: str = "../vkusvill.db"
 
 
+class VectorConfig(BaseModel):
+    index_path: str = "data/products.faiss"
+    embedding_model: str = "qwen/qwen3-embedding-8b"
+    candidate_pool: int = 200
+    fts_boost: bool = True
+
+
 class LLMConfig(BaseModel):
     provider: str = "openrouter"
     model: str = "qwen/qwen3-235b-a22b:free"
@@ -50,6 +57,7 @@ class Settings(BaseModel):
     telegram: TelegramConfig = TelegramConfig()
     mcp: MCPConfig = MCPConfig()
     db: DBConfig = DBConfig()
+    vector: VectorConfig = VectorConfig()
     llm: LLMConfig = LLMConfig()
     sgr: SgrConfig = SgrConfig()
 
@@ -73,6 +81,15 @@ class Settings(BaseModel):
         if db_path:
             db["path"] = db_path
         data["db"] = db
+
+        vector = data.get("vector", {})
+        index_path = os.getenv("VECTOR_INDEX_PATH")
+        if index_path:
+            vector["index_path"] = index_path
+        embedding_model = os.getenv("OPENROUTER_EMBEDDING_MODEL")
+        if embedding_model:
+            vector["embedding_model"] = embedding_model
+        data["vector"] = vector
 
         llm = data.get("llm", {})
         llm_api_key = os.getenv("OPENROUTER_API_KEY")

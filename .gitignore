@@ -25,9 +25,14 @@ logs/
 /data/*.db
 /data/*.sqlite
 /data/*.sqlite3
+/data/*.faiss
+/data/*.index
+/data/*.json
 *.db
 *.sqlite
 *.sqlite3
+*.faiss
+*.index
 
 # OS
 .DS_Store

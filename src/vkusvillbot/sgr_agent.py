@@ -11,6 +11,7 @@ from pydantic import BaseModel, ValidationError
 from vkusvillbot.db import Database
 from vkusvillbot.mcp_client import MCPError, VkusvillMCP
 from vkusvillbot.models import UserProfile
+from vkusvillbot.product_retriever import ProductRetriever, SortSpec
 from vkusvillbot.prompts import build_system_prompt
 
 logger = logging.getLogger(__name__)
@@ -122,15 +123,16 @@ class SgrAgent:
         mcp: VkusvillMCP,
         llm: LLMClient,
         db: Database,
+        retriever: ProductRetriever | None,
         config: SgrConfig,
         profile: UserProfile,
     ) -> None:
         self.mcp = mcp
         self.llm = llm
         self.db = db
+        self.retriever = retriever
         self.config = config
         self.profile = profile
-        self._mcp_search_cache: set[str] = set()
 
     async def run(
         self,
@@ -191,57 +193,18 @@ class SgrAgent:
                     query = str(args.get("q", "") or "")
                     page = int(args.get("page", 1))
                     limit = self.config.max_items_per_search
-                    offset = max(0, (page - 1) * limit)
-
-                    local_items = self.db.search_products(query, limit=limit, offset=offset)
-                    needs_mcp = self.config.use_mcp_refresh and query not in self._mcp_search_cache
-                    mcp_items: list[dict[str, Any]] = []
-                    mcp_meta: dict[str, Any] | None = None
-                    if needs_mcp:
-                        data = await self.mcp.search(query, page)
-                        mcp_items = data.get("data", {}).get("items", []) if data else []
-                        mcp_meta = data.get("data", {}).get("meta")
+                    data = await self.mcp.search(query, page)
+                    mcp_items = data.get("data", {}).get("items", []) if data else []
+                    if mcp_items:
                         self.db.upsert_products_from_mcp(mcp_items)
-                        self._mcp_search_cache.add(query)
-
-                    merged_items = _merge_items(local_items, mcp_items, limit)
-                    compact = {
-                        "ok": True,
-                        "data": {
-                            "items": merged_items,
-                            "meta": mcp_meta,
-                            "source": "hybrid" if mcp_items else "local",
-                        },
-                    }
+                    compact = compact_search(data, limit)
                 elif tool == "vkusvill_product_details":
                     product_id = int(args.get("id"))
-                    local_details = self.db.get_product_details(product_id)
-                    needs_details = True
-                    if local_details:
-                        updated_at = (
-                            local_details.get("updated_at")
-                            if isinstance(local_details, dict)
-                            else None
-                        )
-                        needs_details = self.db.is_stale(
-                            str(updated_at) if updated_at else None,
-                            self.config.local_fresh_hours,
-                        )
-                        if not local_details.get("properties"):
-                            needs_details = True
-                    if self.config.use_mcp_refresh and needs_details:
-                        data = await self.mcp.details(product_id)
-                        details = data.get("data", {}) if data else {}
+                    data = await self.mcp.details(product_id)
+                    details = data.get("data", {}) if data else {}
+                    if details:
                         self.db.update_product_details_from_mcp(details)
-                        local_details = self.db.get_product_details(product_id)
-                    if local_details:
-                        compact = {
-                            "ok": True,
-                            "data": _strip_internal_fields(local_details),
-                        }
-                    else:
-                        data = await self.mcp.details(product_id)
-                        compact = compact_details(data)
+                    compact = compact_details(data)
                 elif tool == "vkusvill_cart_link_create":
                     data = await self.mcp.cart(args.get("products", []))
                     compact = {"ok": data.get("ok"), "data": data.get("data")}
@@ -260,6 +223,28 @@ class SgrAgent:
                         "ok": True,
                         "data": {"items": items, "source": "local"},
                     }
+                elif tool == "local_semantic_search":
+                    if not self.retriever:
+                        compact = {"ok": False, "error": "semantic_search_not_configured"}
+                    else:
+                        query = str(args.get("q", "") or "")
+                        page = int(args.get("page", 1))
+                        limit = int(args.get("limit", self.config.max_items_per_search))
+                        offset = max(0, (page - 1) * limit)
+                        sort = _parse_sort(args.get("sort"))
+                        items = await self.retriever.semantic_search(
+                            query,
+                            limit=limit,
+                            offset=offset,
+                            categories=args.get("categories"),
+                            filter_expr=args.get("filter_expr"),
+                            sort=sort,
+                            include_missing=bool(args.get("include_missing", False)),
+                        )
+                        compact = {
+                            "ok": True,
+                            "data": {"items": items, "source": "local_faiss"},
+                        }
                 elif tool == "local_product_details":
                     product_id = int(args.get("id"))
                     local_details = self.db.get_product_details(product_id)
@@ -270,10 +255,6 @@ class SgrAgent:
                         }
                     else:
                         compact = {"ok": False, "error": "not_found"}
-                elif tool == "local_top_protein":
-                    limit = int(args.get("limit", 5))
-                    items = self.db.get_top_protein(limit=limit)
-                    compact = {"ok": True, "data": {"items": items, "source": "local"}}
                 elif tool == "local_nutrition_query":
                     compact = {
                         "ok": True,
@@ -294,6 +275,7 @@ class SgrAgent:
                                 max_kcal=_to_float(args.get("max_kcal")),
                                 sort_by=str(args.get("sort_by") or "protein"),
                                 order=str(args.get("order") or "desc"),
+                                sort=args.get("sort"),
                                 include_missing=bool(args.get("include_missing", False)),
                             ),
                             "source": "local",
@@ -394,3 +376,29 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _parse_sort(raw: Any) -> list[SortSpec] | None:
+    if not raw:
+        return None
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        spec: list[SortSpec] = []
+        for part in parts:
+            tokens = part.split()
+            field = tokens[0]
+            direction = tokens[1] if len(tokens) > 1 else "desc"
+            spec.append(SortSpec(field=field, direction=direction))
+        return spec or None
+    if isinstance(raw, list):
+        spec = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            field = str(item.get("field") or "").strip()
+            if not field:
+                continue
+            direction = str(item.get("dir") or item.get("direction") or "desc")
+            spec.append(SortSpec(field=field, direction=direction))
+        return spec or None
+    return None

@@ -6,6 +6,11 @@ mcp:
   url: https://mcp001.vkusvill.ru/mcp
 db:
   path: ../vkusvill.db
+vector:
+  index_path: data/products.faiss
+  embedding_model: qwen/qwen3-embedding-8b
+  candidate_pool: 200
+  fts_boost: true
 llm:
   provider: openrouter
   model: qwen/qwen3-235b-a22b-2507

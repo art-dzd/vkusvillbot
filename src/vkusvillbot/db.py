@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -92,9 +94,85 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id);
             CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
+
+            CREATE TABLE IF NOT EXISTS product_embeddings (
+              product_id INTEGER NOT NULL,
+              embedding_model TEXT NOT NULL,
+              content_hash TEXT NOT NULL,
+              embedding BLOB NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (product_id, embedding_model)
+            );
+            CREATE INDEX IF NOT EXISTS idx_product_embeddings_model
+              ON product_embeddings(embedding_model);
             """
         )
         self.conn.commit()
+
+    def ensure_fts(self) -> None:
+        if not self.has_products():
+            return
+        try:
+            exists = self._table_exists("products_fts")
+            if not exists:
+                self.conn.execute(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS products_fts
+                    USING fts5(
+                      name,
+                      description_short,
+                      description_full,
+                      composition,
+                      content='products',
+                      content_rowid='id',
+                      tokenize='unicode61'
+                    );
+                    """
+                )
+
+            self.conn.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS products_ai AFTER INSERT ON products BEGIN
+                  INSERT INTO products_fts(
+                    rowid, name, description_short, description_full, composition
+                  )
+                  VALUES (
+                    new.id, new.name, new.description_short, new.description_full, new.composition
+                  );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS products_ad AFTER DELETE ON products BEGIN
+                  INSERT INTO products_fts(
+                    products_fts, rowid, name, description_short, description_full, composition
+                  )
+                  VALUES (
+                    'delete', old.id, old.name,
+                    old.description_short, old.description_full, old.composition
+                  );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS products_au AFTER UPDATE ON products BEGIN
+                  INSERT INTO products_fts(
+                    products_fts, rowid, name, description_short, description_full, composition
+                  )
+                  VALUES (
+                    'delete', old.id, old.name,
+                    old.description_short, old.description_full, old.composition
+                  );
+                  INSERT INTO products_fts(
+                    rowid, name, description_short, description_full, composition
+                  )
+                  VALUES (
+                    new.id, new.name, new.description_short, new.description_full, new.composition
+                  );
+                END;
+                """
+            )
+            if not exists:
+                self.conn.execute("INSERT INTO products_fts(products_fts) VALUES('rebuild');")
+            self.conn.commit()
+        except sqlite3.OperationalError as exc:
+            logging.getLogger(__name__).warning("FTS5 недоступен: %s", exc)
 
     def _table_exists(self, name: str) -> bool:
         row = self.conn.execute(
@@ -216,26 +294,45 @@ class Database:
         tokens = _tokenize_query(query)
         if not tokens:
             tokens = [query.strip()]
-        clauses = []
-        params: list[str] = []
-        for token in tokens:
-            clauses.append("(name LIKE ? OR description_short LIKE ? OR description_full LIKE ?)")
-            like = f"%{token}%"
-            params.extend([like, like, like])
-        where_sql = " AND ".join(clauses) if clauses else "1=1"
-        params.extend([limit, offset])
-        rows = self.conn.execute(
-            f"""
-            SELECT id, xml_id, name, price_current, rating_avg, rating_count, unit,
-                   weight_value, weight_unit, url, category_json, description_short, updated_at
-            FROM products
-            WHERE {where_sql}
-            ORDER BY (rating_avg IS NULL), rating_avg DESC, rating_count DESC,
-                     price_current ASC, updated_at DESC
-            LIMIT ? OFFSET ?
-            """,
-            params,
-        ).fetchall()
+        has_fts = self._table_exists("products_fts")
+        if has_fts:
+            fts_query = _build_fts_query(tokens)
+            rows = self.conn.execute(
+                """
+                SELECT p.id, p.xml_id, p.name, p.price_current, p.rating_avg, p.rating_count,
+                       p.unit, p.weight_value, p.weight_unit, p.url, p.category_json,
+                       p.description_short, p.updated_at
+                FROM products_fts f
+                JOIN products p ON p.id = f.rowid
+                WHERE f MATCH ?
+                ORDER BY bm25(f), (p.rating_avg IS NULL), p.rating_avg DESC, p.rating_count DESC,
+                         p.price_current ASC, p.updated_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (fts_query, limit, offset),
+            ).fetchall()
+        else:
+            clauses = []
+            params: list[str] = []
+            for token in tokens:
+                clauses.append(
+                    "(name LIKE ? OR description_short LIKE ? OR description_full LIKE ?)"
+                )
+                like = f"%{token}%"
+                params.extend([like, like, like])
+            where_sql = " AND ".join(clauses) if clauses else "1=1"
+            rows = self.conn.execute(
+                f"""
+                SELECT id, xml_id, name, price_current, rating_avg, rating_count, unit,
+                       weight_value, weight_unit, url, category_json, description_short, updated_at
+                FROM products
+                WHERE {where_sql}
+                ORDER BY (rating_avg IS NULL), rating_avg DESC, rating_count DESC,
+                         price_current ASC, updated_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, limit, offset],
+            ).fetchall()
         items = [_product_row_to_item(row) for row in rows]
         cat_tokens = _normalize_category_tokens(categories)
         if not cat_tokens:
@@ -264,6 +361,33 @@ class Database:
         ).fetchall() if self._table_exists("product_properties") else []
         return _product_details_from_row(row, props)
 
+    def get_products_by_ids(self, product_ids: list[int]) -> list[dict[str, object]]:
+        if not self.has_products() or not product_ids:
+            return []
+        ids = [int(pid) for pid in product_ids]
+        placeholders = ",".join("?" for _ in ids)
+        rows = self.conn.execute(
+            f"""
+            SELECT id, xml_id, name, nutrition,
+                   price_current, rating_avg, rating_count,
+                   unit, weight_value, weight_unit,
+                   url, category_json, description_short, updated_at
+            FROM products
+            WHERE id IN ({placeholders})
+            """,
+            ids,
+        ).fetchall()
+        items = []
+        for row in rows:
+            item = _product_row_to_item(row)
+            item["rating_count"] = row["rating_count"]
+            item["nutrition"] = row["nutrition"]
+            item["description_short"] = row["description_short"]
+            item["weight_value"] = row["weight_value"]
+            item["weight_unit"] = row["weight_unit"]
+            items.append(item)
+        return items
+
     def nutrition_query(
         self,
         query: str | None = None,
@@ -279,6 +403,7 @@ class Database:
         max_kcal: float | None = None,
         sort_by: str | None = None,
         order: str = "desc",
+        sort: object | None = None,
         include_missing: bool = False,
         categories: list[str] | str | None = None,
         filter_expr: str | None = None,
@@ -287,23 +412,41 @@ class Database:
             return []
 
         tokens = _tokenize_query(query or "")
-        clauses = []
-        params: list[str] = []
-        for token in tokens:
-            clauses.append("(name LIKE ? OR description_short LIKE ? OR description_full LIKE ?)")
-            like = f"%{token}%"
-            params.extend([like, like, like])
-        where_sql = " AND ".join(clauses) if clauses else "1=1"
+        has_fts = self._table_exists("products_fts")
+        if tokens and has_fts:
+            fts_query = _build_fts_query(tokens)
+            rows = self.conn.execute(
+                """
+                SELECT p.id, p.xml_id, p.name, p.nutrition,
+                       p.price_current, p.rating_avg, p.rating_count,
+                       p.unit, p.weight_value, p.weight_unit,
+                       p.url, p.category_json, p.updated_at
+                FROM products_fts f
+                JOIN products p ON p.id = f.rowid
+                WHERE f MATCH ?
+                """,
+                (fts_query,),
+            ).fetchall()
+        else:
+            clauses = []
+            params: list[str] = []
+            for token in tokens:
+                clauses.append(
+                    "(name LIKE ? OR description_short LIKE ? OR description_full LIKE ?)"
+                )
+                like = f"%{token}%"
+                params.extend([like, like, like])
+            where_sql = " AND ".join(clauses) if clauses else "1=1"
 
-        rows = self.conn.execute(
-            f"""
-            SELECT id, xml_id, name, nutrition, price_current, rating_avg,
-                   unit, weight_value, weight_unit, url, category_json, updated_at
-            FROM products
-            WHERE {where_sql}
-            """,
-            params,
-        ).fetchall()
+            rows = self.conn.execute(
+                f"""
+                SELECT id, xml_id, name, nutrition, price_current, rating_avg, rating_count,
+                       unit, weight_value, weight_unit, url, category_json, updated_at
+                FROM products
+                WHERE {where_sql}
+                """,
+                params,
+            ).fetchall()
         cat_tokens = _normalize_category_tokens(categories)
         filters = _parse_filter_expr(filter_expr)
 
@@ -334,6 +477,7 @@ class Database:
                 continue
 
             item = _product_row_to_item(row)
+            item["rating_count"] = row["rating_count"]
             if cat_tokens and not _match_categories(item.get("category"), cat_tokens):
                 continue
             item.update(
@@ -356,10 +500,10 @@ class Database:
                 continue
             items.append(item)
 
-        sort_key = (sort_by or "protein").lower()
-        reverse = order.lower() != "asc"
+        sort_spec = _normalize_sort_spec(sort, sort_by=sort_by, order=order)
 
-        def sort_value(item: dict[str, object]) -> float:
+        def value_for(item: dict[str, object], field: str) -> float | None:
+            field = field.lower()
             value_map = {
                 "protein": item.get("protein_per_100g"),
                 "fat": item.get("fat_per_100g"),
@@ -367,20 +511,176 @@ class Database:
                 "kcal": item.get("kcal_per_100g"),
                 "price": item.get("price"),
                 "rating": item.get("rating"),
+                "rating_count": item.get("rating_count"),
             }
-            value = value_map.get(sort_key)
+            value = value_map.get(field)
             if value is None:
-                return float("-inf") if reverse else float("inf")
+                return None
             try:
                 return float(value)
             except (TypeError, ValueError):
-                return float("-inf") if reverse else float("inf")
+                return None
 
-        items.sort(key=sort_value, reverse=reverse)
+        def key(item: dict[str, object]) -> tuple[tuple[int, float], ...]:
+            keys: list[tuple[int, float]] = []
+            for field, direction in sort_spec:
+                direction = (direction or "desc").lower()
+                v = value_for(item, field)
+                missing = 1 if v is None else 0
+                if v is None:
+                    v_adj = 0.0
+                else:
+                    v_adj = v if direction == "asc" else -v
+                keys.append((missing, v_adj))
+            return tuple(keys)
+
+        items.sort(key=key)
         if limit < 1:
             limit = 10
         offset = max(0, (page - 1) * limit)
         return items[offset : offset + limit]
+
+    def list_products_for_embedding(self) -> list[dict[str, object]]:
+        if not self.has_products():
+            return []
+        rows = self.conn.execute(
+            """
+            SELECT id, name, description_short, description_full, composition, category_json, brand
+            FROM products
+            ORDER BY id
+            """
+        ).fetchall()
+        items: list[dict[str, object]] = []
+        for row in rows:
+            items.append(
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "description_short": row["description_short"],
+                    "description_full": row["description_full"],
+                    "composition": row["composition"],
+                    "category_json": row["category_json"],
+                    "brand": row["brand"],
+                }
+            )
+        return items
+
+    def get_existing_embedding_hashes(
+        self, product_ids: list[int], embedding_model: str
+    ) -> dict[int, str]:
+        if not product_ids:
+            return {}
+        placeholders = ",".join("?" for _ in product_ids)
+        rows = self.conn.execute(
+            f"""
+            SELECT product_id, content_hash
+            FROM product_embeddings
+            WHERE embedding_model = ?
+              AND product_id IN ({placeholders})
+            """,
+            [embedding_model, *product_ids],
+        ).fetchall()
+        return {int(row["product_id"]): str(row["content_hash"]) for row in rows}
+
+    def upsert_embeddings(self, rows: list[tuple[int, str, str, bytes, str]]) -> None:
+        if not rows:
+            return
+        self.conn.executemany(
+            """
+            INSERT INTO product_embeddings (
+              product_id, embedding_model, content_hash, embedding, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(product_id, embedding_model) DO UPDATE SET
+              content_hash=excluded.content_hash,
+              embedding=excluded.embedding,
+              updated_at=excluded.updated_at
+            """,
+            rows,
+        )
+        self.conn.commit()
+
+    def load_embeddings(self, embedding_model: str) -> list[tuple[int, bytes, str]]:
+        rows = self.conn.execute(
+            """
+            SELECT product_id, embedding, content_hash
+            FROM product_embeddings
+            WHERE embedding_model = ?
+            ORDER BY product_id
+            """,
+            (embedding_model,),
+        ).fetchall()
+        return [
+            (int(row["product_id"]), bytes(row["embedding"]), str(row["content_hash"]))
+            for row in rows
+        ]
+
+    def fts_match_ids(self, query: str, candidate_ids: list[int], limit: int = 500) -> set[int]:
+        if not candidate_ids:
+            return set()
+        if not self._table_exists("products_fts"):
+            return set()
+        tokens = _tokenize_query(query)
+        if not tokens:
+            return set()
+        fts_query = _build_fts_query(tokens)
+        if not fts_query:
+            return set()
+        placeholders = ",".join("?" for _ in candidate_ids)
+        rows = self.conn.execute(
+            f"""
+            SELECT rowid
+            FROM products_fts
+            WHERE products_fts MATCH ?
+              AND rowid IN ({placeholders})
+            LIMIT ?
+            """,
+            [fts_query, *candidate_ids, int(limit)],
+        ).fetchall()
+        return {int(row["rowid"]) for row in rows}
+
+    @staticmethod
+    def embedding_text(item: dict[str, object]) -> str:
+        name = _normalize_field(item.get("name")) or ""
+        brand = _normalize_field(item.get("brand"))
+        desc_short = _normalize_field(item.get("description_short"))
+        desc_full = _normalize_field(item.get("description_full"))
+        composition = _normalize_field(item.get("composition"))
+        categories: list[str] = []
+        raw_cat = item.get("category_json")
+        if raw_cat:
+            try:
+                parsed = json.loads(raw_cat) if isinstance(raw_cat, str) else raw_cat
+                if isinstance(parsed, list):
+                    categories = [str(x) for x in parsed if str(x).strip()]
+                elif parsed is not None:
+                    categories = [str(parsed)]
+            except json.JSONDecodeError:
+                categories = [str(raw_cat)]
+
+        def clip(text: str | None, max_len: int) -> str | None:
+            if not text:
+                return None
+            return text[:max_len]
+
+        parts: list[str] = [name]
+        if brand:
+            parts.append(f"Бренд: {brand}")
+        if categories:
+            parts.append("Категория: " + " / ".join(categories[:6]))
+        if desc_short:
+            parts.append("Описание: " + desc_short)
+        full = clip(desc_full, 800)
+        if full:
+            parts.append("Подробно: " + full)
+        comp = clip(composition, 600)
+        if comp:
+            parts.append("Состав: " + comp)
+        return "\n".join([p for p in parts if p.strip()])
+
+    @staticmethod
+    def embedding_hash(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     def upsert_products_from_mcp(self, items: list[dict[str, object]]) -> None:
         if not self.has_products():
@@ -497,6 +797,46 @@ def _normalize_field(value: object | None) -> str | None:
     text = str(value).replace("\u00a0", " ").strip()
     text = re.sub(r"\s+", " ", text)
     return text or None
+
+
+def _build_fts_query(tokens: list[str]) -> str:
+    safe: list[str] = []
+    for token in tokens:
+        token = re.sub(r"[^0-9a-zа-яё_]+", "", token, flags=re.IGNORECASE)
+        if not token:
+            continue
+        safe.append(f"{token}*")
+    return " AND ".join(safe) if safe else ""
+
+
+def _normalize_sort_spec(
+    raw: object | None,
+    *,
+    sort_by: str | None,
+    order: str,
+) -> list[tuple[str, str]]:
+    spec: list[tuple[str, str]] = []
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        for part in parts:
+            tokens = part.split()
+            field = tokens[0].strip()
+            direction = tokens[1].strip() if len(tokens) > 1 else "desc"
+            if field:
+                spec.append((field, direction))
+    elif isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            field = str(item.get("field") or "").strip()
+            if not field:
+                continue
+            direction = str(item.get("dir") or item.get("direction") or "desc").strip()
+            spec.append((field, direction))
+
+    if not spec:
+        spec = [(str(sort_by or "protein"), str(order or "desc"))]
+    return spec
 
 
 def _extract_protein_per_100g(text: str | None) -> float | None:

@@ -10,12 +10,15 @@ from aiogram.types import Message
 
 from vkusvillbot.config import Settings
 from vkusvillbot.db import Database
+from vkusvillbot.embeddings_client import OpenRouterEmbeddingsClient
 from vkusvillbot.formatting import to_telegram_markdown
 from vkusvillbot.llm_client import OpenRouterClient
 from vkusvillbot.logging import setup_dialog_logger, setup_logging
 from vkusvillbot.mcp_client import MCPError, VkusvillMCP
 from vkusvillbot.models import UserProfile
+from vkusvillbot.product_retriever import ProductRetriever
 from vkusvillbot.sgr_agent import SgrAgent, SgrConfig
+from vkusvillbot.vector_index import FaissVectorIndex
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,7 @@ async def main() -> None:
     db = Database(settings.db.path)
     if db.has_products():
         db.ensure_product_columns()
+        db.ensure_fts()
     mcp = VkusvillMCP(settings.mcp.url)
     await mcp.connect()
 
@@ -43,10 +47,29 @@ async def main() -> None:
         proxy_url=settings.llm.proxy_url,
     )
 
+    embeddings = OpenRouterEmbeddingsClient(
+        api_key=settings.llm.api_key,
+        model=settings.vector.embedding_model,
+        referer=settings.llm.http_referer,
+        title=settings.llm.title,
+        proxy_url=settings.llm.proxy_url,
+    )
+    index = FaissVectorIndex(settings.vector.index_path)
+    retriever = ProductRetriever(
+        db=db,
+        embeddings=embeddings,
+        index=index,
+        candidate_pool=settings.vector.candidate_pool,
+        fts_boost=settings.vector.fts_boost,
+    )
+
     sgr_config = SgrConfig(
         max_steps=settings.sgr.max_steps,
         max_items_per_search=settings.sgr.max_items_per_search,
         temperature=settings.sgr.temperature,
+        history_messages=settings.sgr.history_messages,
+        local_fresh_hours=settings.sgr.local_fresh_hours,
+        use_mcp_refresh=settings.sgr.use_mcp_refresh,
     )
 
     bot = Bot(token=settings.telegram.token)
@@ -90,7 +113,14 @@ async def main() -> None:
     async def on_text(message: Message) -> None:
         user = db.get_or_create_user(message.from_user.id)
         profile = UserProfile(city=user.city, diet_notes=user.diet_notes)
-        agent = SgrAgent(mcp=mcp, llm=llm, db=db, config=sgr_config, profile=profile)
+        agent = SgrAgent(
+            mcp=mcp,
+            llm=llm,
+            db=db,
+            retriever=retriever,
+            config=sgr_config,
+            profile=profile,
+        )
         text = message.text or ""
         try:
             dialog_logger.info("USER tg_id=%s user_id=%s: %s", message.from_user.id, user.id, text)
