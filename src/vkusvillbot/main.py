@@ -31,6 +31,30 @@ logger = logging.getLogger(__name__)
 _TG_MAX_LEN = 4096
 
 
+def _topic_ctx(message: Message) -> tuple[int | None, dict[str, int]]:
+    """
+    Возвращает:
+    - key: идентификатор топика для истории/контекста (thread_id или dm_topic_id)
+    - kwargs: параметры для отправки ответа в тот же топик
+
+    Telegram имеет 2 похожих механики:
+    - message_thread_id: forum topics (в т.ч. topics в личке бота)
+    - direct_messages_topic_id: direct messages chat topics (отдельная механика)
+    """
+
+    if message.message_thread_id is not None:
+        tid = int(message.message_thread_id)
+        return tid, {"message_thread_id": tid}
+
+    dm_topic = getattr(message, "direct_messages_topic", None)
+    dm_tid = getattr(dm_topic, "topic_id", None)
+    if dm_tid is not None:
+        dm_tid_int = int(dm_tid)
+        return dm_tid_int, {"direct_messages_topic_id": dm_tid_int}
+
+    return None, {}
+
+
 def _split_text(text: str, limit: int = _TG_MAX_LEN) -> list[str]:
     if not text:
         return []
@@ -289,15 +313,20 @@ async def main() -> None:
 
     @dp.message(F.text)
     async def on_text(message: Message) -> None:
-        thread_id = message.message_thread_id
-        use_drafts = bool(settings.telegram.enable_drafts and topics_enabled)
+        thread_key, reply_kwargs = _topic_ctx(message)
+        # sendMessageDraft поддерживает только message_thread_id.
+        use_drafts = bool(
+            settings.telegram.enable_drafts
+            and topics_enabled
+            and message.message_thread_id is not None
+        )
         draft: DraftProgress | None = None
         if use_drafts:
             draft = DraftProgress(
                 api=tg_api,
                 chat_id=cast(int, message.chat.id),
                 draft_id=cast(int, message.message_id),
-                message_thread_id=thread_id,
+                message_thread_id=int(message.message_thread_id),
                 enabled=bool(settings.telegram.show_progress),
             )
             try:
@@ -315,7 +344,7 @@ async def main() -> None:
             placeholder = await message.answer(
                 "Думаю…",
                 disable_web_page_preview=True,
-                message_thread_id=thread_id,
+                **reply_kwargs,
             )
             fallback_progress = MessageProgress(
                 placeholder,
@@ -327,7 +356,7 @@ async def main() -> None:
                     bot,
                     message.chat.id,
                     stop_typing,
-                    message_thread_id=thread_id,
+                    message_thread_id=message.message_thread_id,
                 )
             )
 
@@ -344,24 +373,33 @@ async def main() -> None:
         text = message.text or ""
         try:
             dialog_logger.info(
-                "USER tg_id=%s user_id=%s thread_id=%s: %s",
+                "USER tg_id=%s user_id=%s thread_key=%s thread_id=%s dm_topic_id=%s: %s",
                 message.from_user.id,
                 user.id,
-                thread_id,
+                thread_key,
+                message.message_thread_id,
+                getattr(getattr(message, "direct_messages_topic", None), "topic_id", None),
                 text,
             )
             history = db.get_recent_messages(
                 user.id,
                 limit=settings.sgr.history_messages,
-                thread_id=thread_id,
+                thread_id=thread_key,
             )
             progress_cb = draft.add if draft else None
             if not progress_cb and fallback_progress:
                 progress_cb = fallback_progress.add
             reply = await agent.run(text, history=history, user_id=user.id, progress=progress_cb)
-            db.save_message(user.id, "user", text, thread_id=thread_id)
-            db.save_message(user.id, "assistant", reply, thread_id=thread_id)
-            dialog_logger.info("ASSISTANT user_id=%s thread_id=%s: %s", user.id, thread_id, reply)
+            db.save_message(user.id, "user", text, thread_id=thread_key)
+            db.save_message(user.id, "assistant", reply, thread_id=thread_key)
+            dialog_logger.info(
+                "ASSISTANT user_id=%s thread_key=%s thread_id=%s dm_topic_id=%s: %s",
+                user.id,
+                thread_key,
+                message.message_thread_id,
+                getattr(getattr(message, "direct_messages_topic", None), "topic_id", None),
+                reply,
+            )
             db.save_session(user.id, "sgr", {"query": text})
 
             if draft:
@@ -375,14 +413,14 @@ async def main() -> None:
                     await message.answer(
                         "Ответ слишком длинный — отправляю частями.",
                         disable_web_page_preview=True,
-                        message_thread_id=thread_id,
+                        **reply_kwargs,
                     )
                 for part_md in parts_md:
                     await message.answer(
                         part_md,
                         parse_mode=ParseMode.MARKDOWN_V2,
                         disable_web_page_preview=True,
-                        message_thread_id=thread_id,
+                        **reply_kwargs,
                     )
             except TelegramBadRequest:
                 # На всякий случай: если MarkdownV2 не отправился (лимиты/парсинг),
@@ -391,7 +429,7 @@ async def main() -> None:
                     await message.answer(
                         part,
                         disable_web_page_preview=True,
-                        message_thread_id=thread_id,
+                        **reply_kwargs,
                     )
 
             if placeholder:
@@ -404,7 +442,7 @@ async def main() -> None:
             else:
                 await message.answer(
                     f"Ошибка MCP: {exc}",
-                    message_thread_id=thread_id,
+                    **reply_kwargs,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unhandled error")
@@ -413,7 +451,7 @@ async def main() -> None:
             else:
                 await message.answer(
                     f"Ошибка: {exc}",
-                    message_thread_id=thread_id,
+                    **reply_kwargs,
                 )
         finally:
             stop_typing.set()
