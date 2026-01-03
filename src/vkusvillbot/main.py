@@ -314,6 +314,7 @@ async def main() -> None:
     @dp.message(F.text)
     async def on_text(message: Message) -> None:
         thread_key, reply_kwargs = _topic_ctx(message)
+        reply_kwargs = dict(reply_kwargs)
         # sendMessageDraft поддерживает только message_thread_id.
         use_drafts = bool(
             settings.telegram.enable_drafts
@@ -341,11 +342,23 @@ async def main() -> None:
         stop_typing = asyncio.Event()
         typing_task: asyncio.Task[None] | None = None
         if not use_drafts:
+            # Для первого сообщения в новой беседе Telegram может не прислать thread_id,
+            # но при отправке "reply_to_message_id" клиент сам положит ответ в правильный топик.
+            placeholder_kwargs = dict(reply_kwargs)
+            if not placeholder_kwargs:
+                placeholder_kwargs["reply_to_message_id"] = message.message_id
+
             placeholder = await message.answer(
                 "Думаю…",
                 disable_web_page_preview=True,
-                **reply_kwargs,
+                **placeholder_kwargs,
             )
+
+            # После ответа пытаемся определить фактический топик из отправленного сообщения.
+            if not reply_kwargs:
+                thread_key, reply_kwargs = _topic_ctx(placeholder)
+                reply_kwargs = dict(reply_kwargs)
+
             fallback_progress = MessageProgress(
                 placeholder,
                 enabled=bool(settings.telegram.show_progress),
@@ -356,7 +369,7 @@ async def main() -> None:
                     bot,
                     message.chat.id,
                     stop_typing,
-                    message_thread_id=message.message_thread_id,
+                    message_thread_id=(placeholder.message_thread_id or message.message_thread_id),
                 )
             )
 
@@ -381,11 +394,16 @@ async def main() -> None:
                 getattr(getattr(message, "direct_messages_topic", None), "topic_id", None),
                 text,
             )
-            history = db.get_recent_messages(
-                user.id,
-                limit=settings.sgr.history_messages,
-                thread_id=thread_key,
-            )
+            history: list[dict[str, str]]
+            if thread_key is None and topics_enabled:
+                # Если включены топики, но идентификатор не известен — не тянем историю из "общего".
+                history = []
+            else:
+                history = db.get_recent_messages(
+                    user.id,
+                    limit=settings.sgr.history_messages,
+                    thread_id=thread_key,
+                )
             progress_cb = draft.add if draft else None
             if not progress_cb and fallback_progress:
                 progress_cb = fallback_progress.add
