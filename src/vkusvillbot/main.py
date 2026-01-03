@@ -29,9 +29,14 @@ logger = logging.getLogger(__name__)
 
 
 _TG_MAX_LEN = 4096
+_PENDING_TOPIC_TTL_S = 10.0
 
 
-def _topic_ctx(message: Message) -> tuple[int, dict[str, int]]:
+def _topic_ctx(
+    message: Message,
+    *,
+    pending_topic_id: int | None = None,
+) -> tuple[int, dict[str, int]]:
     """
     Возвращает:
     - key: идентификатор контекста (topic/thread) для истории
@@ -55,6 +60,10 @@ def _topic_ctx(message: Message) -> tuple[int, dict[str, int]]:
     if dm_tid is not None:
         dm_tid_int = int(dm_tid)
         return dm_tid_int, {"direct_messages_topic_id": dm_tid_int}
+
+    if pending_topic_id is not None:
+        tid = int(pending_topic_id)
+        return tid, {"message_thread_id": tid}
 
     root_id = int(message.message_id)
     node = message.reply_to_message
@@ -266,6 +275,33 @@ async def main() -> None:
     bot = Bot(token=settings.telegram.token)
     dp = Dispatcher()
 
+    pending_topics: dict[int, tuple[int, float]] = {}
+
+    def consume_pending_topic_id(chat_id: int) -> int | None:
+        entry = pending_topics.get(chat_id)
+        if not entry:
+            return None
+        topic_id, ts = entry
+        if (time.monotonic() - ts) > _PENDING_TOPIC_TTL_S:
+            pending_topics.pop(chat_id, None)
+            return None
+        pending_topics.pop(chat_id, None)
+        return int(topic_id)
+
+    @dp.message(F.forum_topic_created)
+    async def on_forum_topic_created(message: Message) -> None:
+        # В forum-чатах идентификатор топика совпадает с message_id сообщения "topic created".
+        topic_id = int(message.message_thread_id or message.message_id)
+        pending_topics[int(message.chat.id)] = (topic_id, time.monotonic())
+        dialog_logger.info(
+            "FORUM_TOPIC_CREATED chat_id=%s msg_id=%s message_thread_id=%s topic_id=%s title=%s",
+            message.chat.id,
+            message.message_id,
+            message.message_thread_id,
+            topic_id,
+            getattr(getattr(message, "forum_topic_created", None), "name", None),
+        )
+
     @dp.message(Command("start"))
     async def cmd_start(message: Message) -> None:
         user = db.get_or_create_user(message.from_user.id)
@@ -341,7 +377,11 @@ async def main() -> None:
 
     @dp.message(F.text)
     async def on_text(message: Message) -> None:
-        thread_key, reply_kwargs = _topic_ctx(message)
+        pending_topic_id = None
+        if topics_enabled and message.message_thread_id is None:
+            pending_topic_id = consume_pending_topic_id(int(message.chat.id))
+
+        thread_key, reply_kwargs = _topic_ctx(message, pending_topic_id=pending_topic_id)
         reply_kwargs = dict(reply_kwargs)
         # sendMessageDraft поддерживает только message_thread_id.
         use_drafts = bool(
