@@ -7,6 +7,10 @@ def setup_logging(level: str = "INFO") -> None:
         level=level.upper(),
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+    # httpx на INFO логирует полные URL, включая токен Telegram в /bot<TOKEN>/...
+    # По умолчанию глушим, чтобы секреты не утекали в логи.
+    if logging.getLogger("httpx").level in (logging.NOTSET, logging.INFO):
+        logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def setup_dialog_logger(log_dir: str = "logs") -> logging.Logger:
