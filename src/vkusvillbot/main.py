@@ -243,7 +243,8 @@ async def main() -> None:
                 f"Темы (forum mode) в личке: {topics_status}.\n"
                 f"Стриминг через sendMessageDraft: {streaming_status}.\n\n"
                 "Напишите запрос, например: 'молоко'."
-            )
+            ),
+            message_thread_id=message.message_thread_id,
         )
 
     @dp.message(Command("help"))
@@ -252,26 +253,39 @@ async def main() -> None:
             "Команды:\n"
             "/diet — задать особенности питания\n"
             "/city — задать город\n"
-            "Примеры: 'найди молоко', 'состав творога', 'собери корзину: хлеб молоко'"
+            "Примеры: 'найди молоко', 'состав творога', 'собери корзину: хлеб молоко'",
+            message_thread_id=message.message_thread_id,
         )
 
     @dp.message(Command("diet"))
     async def cmd_diet(message: Message) -> None:
         text = message.text.replace("/diet", "", 1).strip()
         if not text:
-            await message.answer("Напишите особенности питания после команды /diet")
+            await message.answer(
+                "Напишите особенности питания после команды /diet",
+                message_thread_id=message.message_thread_id,
+            )
             return
         db.update_user_diet_notes(message.from_user.id, text)
-        await message.answer("Сохранил особенности питания.")
+        await message.answer(
+            "Сохранил особенности питания.",
+            message_thread_id=message.message_thread_id,
+        )
 
     @dp.message(Command("city"))
     async def cmd_city(message: Message) -> None:
         text = message.text.replace("/city", "", 1).strip()
         if not text:
-            await message.answer("Напишите город после команды /city")
+            await message.answer(
+                "Напишите город после команды /city",
+                message_thread_id=message.message_thread_id,
+            )
             return
         db.update_user_city(message.from_user.id, text)
-        await message.answer(f"Город обновлён: {text}")
+        await message.answer(
+            f"Город обновлён: {text}",
+            message_thread_id=message.message_thread_id,
+        )
 
     @dp.message(F.text)
     async def on_text(message: Message) -> None:
