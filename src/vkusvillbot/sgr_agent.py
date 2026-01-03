@@ -269,6 +269,29 @@ class SgrAgent:
                     limit = int(args.get("limit", 5))
                     items = self.db.get_top_protein(limit=limit)
                     compact = {"ok": True, "data": {"items": items, "source": "local"}}
+                elif tool == "local_nutrition_query":
+                    compact = {
+                        "ok": True,
+                        "data": {
+                            "items": self.db.nutrition_query(
+                                query=args.get("q"),
+                                page=int(args.get("page", 1)),
+                                limit=int(args.get("limit", self.config.max_items_per_search)),
+                                min_protein=_to_float(args.get("min_protein")),
+                                max_protein=_to_float(args.get("max_protein")),
+                                min_fat=_to_float(args.get("min_fat")),
+                                max_fat=_to_float(args.get("max_fat")),
+                                min_carbs=_to_float(args.get("min_carbs")),
+                                max_carbs=_to_float(args.get("max_carbs")),
+                                min_kcal=_to_float(args.get("min_kcal")),
+                                max_kcal=_to_float(args.get("max_kcal")),
+                                sort_by=str(args.get("sort_by") or "protein"),
+                                order=str(args.get("order") or "desc"),
+                                include_missing=bool(args.get("include_missing", False)),
+                            ),
+                            "source": "local",
+                        },
+                    }
                 else:
                     compact = {"ok": False, "error": "unknown_tool"}
 
@@ -355,3 +378,12 @@ def _merge_items(
             merged[pid] = _strip_internal_fields(item)
     result = list(merged.values())
     return result[:limit]
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

@@ -281,6 +281,108 @@ class Database:
         scored.sort(key=lambda item: item["protein_per_100g"], reverse=True)
         return scored[: max(1, limit)]
 
+    def nutrition_query(
+        self,
+        query: str | None = None,
+        limit: int = 10,
+        page: int = 1,
+        min_protein: float | None = None,
+        max_protein: float | None = None,
+        min_fat: float | None = None,
+        max_fat: float | None = None,
+        min_carbs: float | None = None,
+        max_carbs: float | None = None,
+        min_kcal: float | None = None,
+        max_kcal: float | None = None,
+        sort_by: str | None = None,
+        order: str = "desc",
+        include_missing: bool = False,
+    ) -> list[dict[str, object]]:
+        if not self.has_products():
+            return []
+
+        tokens = _tokenize_query(query or "")
+        clauses = []
+        params: list[str] = []
+        for token in tokens:
+            clauses.append("(name LIKE ? OR description_short LIKE ? OR description_full LIKE ?)")
+            like = f"%{token}%"
+            params.extend([like, like, like])
+        where_sql = " AND ".join(clauses) if clauses else "1=1"
+
+        rows = self.conn.execute(
+            f"""
+            SELECT id, xml_id, name, nutrition, price_current, rating_avg,
+                   unit, weight_value, weight_unit, url, category_json, updated_at
+            FROM products
+            WHERE {where_sql}
+            """,
+            params,
+        ).fetchall()
+
+        def within(value: float | None, min_v: float | None, max_v: float | None) -> bool:
+            if value is None:
+                return include_missing
+            if min_v is not None and value < min_v:
+                return False
+            if max_v is not None and value > max_v:
+                return False
+            return True
+
+        items: list[dict[str, object]] = []
+        for row in rows:
+            metrics = _extract_nutrition_metrics(row["nutrition"])
+            protein = metrics.get("protein")
+            fat = metrics.get("fat")
+            carbs = metrics.get("carbs")
+            kcal = metrics.get("kcal")
+
+            if not within(protein, min_protein, max_protein):
+                continue
+            if not within(fat, min_fat, max_fat):
+                continue
+            if not within(carbs, min_carbs, max_carbs):
+                continue
+            if not within(kcal, min_kcal, max_kcal):
+                continue
+
+            item = _product_row_to_item(row)
+            item.update(
+                {
+                    "protein_per_100g": protein,
+                    "fat_per_100g": fat,
+                    "carbs_per_100g": carbs,
+                    "kcal_per_100g": kcal,
+                }
+            )
+            items.append(item)
+
+        sort_key = (sort_by or "protein").lower()
+        reverse = order.lower() != "asc"
+
+        def sort_value(item: dict[str, object]) -> float:
+            value_map = {
+                "protein": item.get("protein_per_100g"),
+                "fat": item.get("fat_per_100g"),
+                "carbs": item.get("carbs_per_100g"),
+                "kcal": item.get("kcal_per_100g"),
+                "price": item.get("price"),
+                "rating": item.get("rating"),
+            }
+            value = value_map.get(sort_key)
+            if value is None:
+                return float("-inf") if reverse else float("inf")
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return float("-inf") if reverse else float("inf")
+
+        items.sort(key=sort_value, reverse=reverse)
+        if limit < 1:
+            limit = 10
+        offset = max(0, (page - 1) * limit)
+        return items[offset : offset + limit]
+
     def upsert_products_from_mcp(self, items: list[dict[str, object]]) -> None:
         if not self.has_products():
             return
@@ -414,6 +516,31 @@ def _extract_protein_per_100g(text: str | None) -> float | None:
         return float(match.group(1).replace(",", "."))
     except ValueError:
         return None
+
+
+def _extract_nutrition_metrics(text: str | None) -> dict[str, float | None]:
+    if not text:
+        return {"protein": None, "fat": None, "carbs": None, "kcal": None}
+    normalized = _normalize_field(text)
+    if not normalized:
+        return {"protein": None, "fat": None, "carbs": None, "kcal": None}
+    lower = normalized.lower()
+
+    def pick(pattern: str) -> float | None:
+        match = re.search(pattern, lower)
+        if not match:
+            return None
+        try:
+            return float(match.group(1).replace(",", "."))
+        except ValueError:
+            return None
+
+    protein = pick(r"белк\w*[^0-9]*([0-9]+[.,]?[0-9]*)")
+    fat = pick(r"жир\w*[^0-9]*([0-9]+[.,]?[0-9]*)")
+    carbs = pick(r"углевод\w*[^0-9]*([0-9]+[.,]?[0-9]*)")
+    kcal = pick(r"([0-9]+[.,]?[0-9]*)\s*к?кал")
+
+    return {"protein": protein, "fat": fat, "carbs": carbs, "kcal": kcal}
 
 
 def _extract_properties(
