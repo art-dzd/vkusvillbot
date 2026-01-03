@@ -245,9 +245,40 @@ class SgrAgent:
                 elif tool == "vkusvill_cart_link_create":
                     data = await self.mcp.cart(args.get("products", []))
                     compact = {"ok": data.get("ok"), "data": data.get("data")}
+                elif tool == "local_products_search":
+                    query = str(args.get("q", "") or "")
+                    page = int(args.get("page", 1))
+                    limit = self.config.max_items_per_search
+                    offset = max(0, (page - 1) * limit)
+                    items = self.db.search_products(query, limit=limit, offset=offset)
+                    compact = {
+                        "ok": True,
+                        "data": {"items": items, "source": "local"},
+                    }
+                elif tool == "local_product_details":
+                    product_id = int(args.get("id"))
+                    local_details = self.db.get_product_details(product_id)
+                    if local_details:
+                        compact = {
+                            "ok": True,
+                            "data": _strip_internal_fields(local_details),
+                        }
+                    else:
+                        compact = {"ok": False, "error": "not_found"}
+                elif tool == "local_top_protein":
+                    limit = int(args.get("limit", 5))
+                    items = self.db.get_top_protein(limit=limit)
+                    compact = {"ok": True, "data": {"items": items, "source": "local"}}
                 else:
                     compact = {"ok": False, "error": "unknown_tool"}
 
+                if user_id is not None:
+                    dialog_logger.info(
+                        "TOOL_RESULT user_id=%s tool=%s: %s",
+                        user_id,
+                        tool,
+                        json.dumps(compact, ensure_ascii=False),
+                    )
                 messages.append(
                     {
                         "role": "user",
@@ -255,6 +286,13 @@ class SgrAgent:
                     }
                 )
             except Exception as exc:  # noqa: BLE001
+                if user_id is not None:
+                    dialog_logger.info(
+                        "TOOL_ERROR user_id=%s tool=%s: %s",
+                        user_id,
+                        tool,
+                        exc,
+                    )
                 messages.append(
                     {
                         "role": "user",

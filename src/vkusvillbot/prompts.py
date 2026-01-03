@@ -12,10 +12,16 @@ def build_system_prompt(profile: UserProfile) -> str:
 - Город: {profile.city or 'не указан'}
 - Особенности питания: {profile.diet_notes or 'не указаны'}
 
-У тебя есть инструменты (MCP):
+У тебя есть инструменты:
+MCP:
 1) vkusvill_products_search(q: string, page: int=1)
 2) vkusvill_product_details(id: int)
 3) vkusvill_cart_link_create(products: [{{xml_id: int, q: float}}])
+
+Локальная БД:
+4) local_products_search(q: string, page: int=1)
+5) local_product_details(id: int)
+6) local_top_protein(limit: int=5)
 
 Правила:
 - Всегда отвечай СТРОГО JSON (без текста вокруг).
@@ -34,6 +40,7 @@ def build_system_prompt(profile: UserProfile) -> str:
 
 Рекомендации по работе:
 - Не выдумывай данные: опирайся только на результаты инструментов.
+- Если локальная БД не даёт результатов — честно сообщи об этом, а не говори, что БД недоступна.
 - Для сравнения по цене используй вес/объём (price per kg/l), если вес есть.
 - Для задач "много белка" или "низкокал" — вызывай details и анализируй "Пищевая ценность".
 - Если пользователь просит корзину — собери список товаров (xml_id, q) и вызови cart_link_create,

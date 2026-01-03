@@ -259,6 +259,28 @@ class Database:
         ).fetchall() if self._table_exists("product_properties") else []
         return _product_details_from_row(row, props)
 
+    def get_top_protein(self, limit: int = 5) -> list[dict[str, object]]:
+        if not self.has_products():
+            return []
+        rows = self.conn.execute(
+            """
+            SELECT id, xml_id, name, nutrition, price_current, rating_avg,
+                   unit, weight_value, weight_unit, url, category_json, updated_at
+            FROM products
+            WHERE nutrition IS NOT NULL AND trim(nutrition) <> ''
+            """,
+        ).fetchall()
+        scored: list[dict[str, object]] = []
+        for row in rows:
+            protein = _extract_protein_per_100g(row["nutrition"])
+            if protein is None:
+                continue
+            item = _product_row_to_item(row)
+            item["protein_per_100g"] = protein
+            scored.append(item)
+        scored.sort(key=lambda item: item["protein_per_100g"], reverse=True)
+        return scored[: max(1, limit)]
+
     def upsert_products_from_mcp(self, items: list[dict[str, object]]) -> None:
         if not self.has_products():
             return
@@ -374,6 +396,24 @@ def _normalize_field(value: object | None) -> str | None:
     text = str(value).replace("\u00a0", " ").strip()
     text = re.sub(r"\s+", " ", text)
     return text or None
+
+
+def _extract_protein_per_100g(text: str | None) -> float | None:
+    if not text:
+        return None
+    normalized = _normalize_field(text)
+    if not normalized:
+        return None
+    match = re.search(
+        r"белк\w*[^0-9]*([0-9]+[.,]?[0-9]*)\s*г",
+        normalized.lower(),
+    )
+    if not match:
+        return None
+    try:
+        return float(match.group(1).replace(",", "."))
+    except ValueError:
+        return None
 
 
 def _extract_properties(

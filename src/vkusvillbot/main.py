@@ -29,6 +29,8 @@ async def main() -> None:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
 
     db = Database(settings.db.path)
+    if db.has_products():
+        db.ensure_product_columns()
     mcp = VkusvillMCP(settings.mcp.url)
     await mcp.connect()
 
