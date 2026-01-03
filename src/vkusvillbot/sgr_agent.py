@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 
 from pydantic import BaseModel, ValidationError
 
@@ -139,7 +139,16 @@ class SgrAgent:
         user_text: str,
         history: list[dict[str, str]] | None = None,
         user_id: int | None = None,
+        progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
+        async def safe_progress(line: str) -> None:
+            if not progress:
+                return
+            try:
+                await progress(line)
+            except Exception:  # noqa: BLE001
+                return
+
         async def render_final(final: FinalAnswer) -> str:
             answer = final.answer
             if final.cart_items and not final.cart_link:
@@ -163,7 +172,10 @@ class SgrAgent:
             messages.extend(history)
         messages.append({"role": "user", "content": user_text})
 
+        await safe_progress("🧠 Думаю…")
+
         for step in range(self.config.max_steps):
+            await safe_progress(f"Шаг {step + 1}/{self.config.max_steps}: запрос к LLM")
             llm_text = await self.llm.chat(messages, temperature=self.config.temperature)
             if user_id is not None:
                 dialog_logger.info("LLM_RAW user_id=%s step=%s: %s", user_id, step, llm_text)
@@ -180,15 +192,23 @@ class SgrAgent:
                         ),
                     }
                 )
+                await safe_progress(f"Шаг {step + 1}: ошибка JSON, прошу повторить")
                 continue
 
             messages.append({"role": "assistant", "content": llm_text})
 
             if isinstance(parsed, FinalAnswer):
+                await safe_progress("✅ Финализирую ответ")
                 return await render_final(parsed)
 
             tool = parsed.tool
             args = parsed.args
+            await safe_progress(
+                (
+                    f"Шаг {step + 1}/{self.config.max_steps}: инструмент {tool} "
+                    f"{_format_tool_args(args)}"
+                )
+            )
             try:
                 if tool == "vkusvill_products_search":
                     query = str(args.get("q", "") or "")
@@ -285,6 +305,7 @@ class SgrAgent:
                 else:
                     compact = {"ok": False, "error": "unknown_tool"}
 
+                await safe_progress(_summarize_tool_result(tool, compact))
                 if user_id is not None:
                     dialog_logger.info(
                         "TOOL_RESULT user_id=%s tool=%s: %s",
@@ -299,6 +320,7 @@ class SgrAgent:
                     }
                 )
             except Exception as exc:  # noqa: BLE001
+                await safe_progress(f"⚠️ Ошибка инструмента {tool}: {exc}")
                 if user_id is not None:
                     dialog_logger.info(
                         "TOOL_ERROR user_id=%s tool=%s: %s",
@@ -316,6 +338,7 @@ class SgrAgent:
 
         # Фоллбек: последняя попытка сформировать final (без дополнительных tool_call).
         try:
+            await safe_progress("⚠️ Лимит шагов исчерпан, последняя попытка финализации")
             messages.append(
                 {
                     "role": "user",
@@ -335,11 +358,50 @@ class SgrAgent:
             else:
                 messages.append({"role": "assistant", "content": llm_text})
                 if isinstance(parsed, FinalAnswer):
+                    await safe_progress("✅ Финализирую ответ")
                     return await render_final(parsed)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Grace final attempt failed: %s", exc)
 
         return "Не успел завершить запрос. Попробуйте уточнить или повторить."
+
+
+def _format_tool_args(args: dict[str, Any]) -> str:
+    if not args:
+        return ""
+    if "q" in args and args.get("q"):
+        q = str(args.get("q"))[:80]
+        return f"(q={q!r})"
+    if "id" in args and args.get("id") is not None:
+        return f"(id={args.get('id')})"
+    if "products" in args and isinstance(args.get("products"), list):
+        return f"(products={len(args.get('products'))})"
+    return ""
+
+
+def _summarize_tool_result(tool: str, compact: dict[str, Any]) -> str:
+    if not compact.get("ok"):
+        return f"↳ Результат {tool}: ошибка ({compact.get('error')})"
+
+    data = compact.get("data") or {}
+    if tool in {"vkusvill_products_search", "local_products_search", "local_semantic_search"}:
+        items = data.get("items") or []
+        source = data.get("source") or "mcp"
+        return f"↳ Найдено: {len(items)} (source={source})"
+
+    if tool in {"vkusvill_product_details", "local_product_details"}:
+        name = (data.get("name") or "").strip()
+        return f"↳ Детали: {name[:80] or 'ok'}"
+
+    if tool == "vkusvill_cart_link_create":
+        link = (data.get("link") or "").strip()
+        return f"↳ Корзина: {'ссылка готова' if link else 'ok'}"
+
+    if tool == "local_nutrition_query":
+        items = data.get("items") or []
+        return f"↳ Подборка: {len(items)}"
+
+    return "↳ OK"
 
 
 def _normalize_weight(value: Any) -> str | None:

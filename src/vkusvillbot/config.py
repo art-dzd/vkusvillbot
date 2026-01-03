@@ -16,6 +16,8 @@ class AppConfig(BaseModel):
 class TelegramConfig(BaseModel):
     bot_username: str = ""
     token: str = Field(default="", repr=False)
+    enable_drafts: bool = True
+    show_progress: bool = True
 
 
 class MCPConfig(BaseModel):

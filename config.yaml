@@ -2,6 +2,8 @@ app:
   log_level: INFO
 telegram:
   bot_username: vkusvillaibot
+  enable_drafts: true
+  show_progress: true
 mcp:
   url: https://mcp001.vkusvill.ru/mcp
 db:
