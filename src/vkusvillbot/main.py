@@ -35,7 +35,7 @@ _PENDING_TOPIC_TTL_S = 10.0
 def _topic_ctx(
     message: Message,
     *,
-    pending_topic_id: int | None = None,
+    pending_routing: dict[str, int] | None = None,
 ) -> tuple[int, dict[str, int]]:
     """
     Возвращает:
@@ -61,9 +61,14 @@ def _topic_ctx(
         dm_tid_int = int(dm_tid)
         return dm_tid_int, {"direct_messages_topic_id": dm_tid_int}
 
-    if pending_topic_id is not None:
-        tid = int(pending_topic_id)
-        return tid, {"message_thread_id": tid}
+    if pending_routing:
+        pending_routing = dict(pending_routing)
+        if "message_thread_id" in pending_routing:
+            tid = int(pending_routing["message_thread_id"])
+            return tid, {"message_thread_id": tid}
+        if "direct_messages_topic_id" in pending_routing:
+            tid = int(pending_routing["direct_messages_topic_id"])
+            return tid, {"direct_messages_topic_id": tid}
 
     root_id = int(message.message_id)
     node = message.reply_to_message
@@ -109,6 +114,54 @@ def _split_text(text: str, limit: int = _TG_MAX_LEN) -> list[str]:
         remaining = remaining.lstrip("\n")
 
     return parts
+
+
+def _reply_root_message_id(message: Message) -> int:
+    root_id = int(message.message_id)
+    node = message.reply_to_message
+    depth = 0
+    while node is not None and depth < 8:
+        root_id = int(node.message_id)
+        node = getattr(node, "reply_to_message", None)
+        depth += 1
+    return root_id
+
+
+async def _safe_send(
+    bot: Bot,
+    *,
+    chat_id: int,
+    text: str,
+    routing: dict[str, int],
+    fallback_routing: dict[str, int],
+    parse_mode: ParseMode | None = None,
+    disable_web_page_preview: bool = True,
+) -> tuple[Message, dict[str, int]]:
+    try:
+        msg = await bot.send_message(
+            chat_id,
+            text,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+            **routing,
+        )
+        return msg, routing
+    except TelegramBadRequest as exc:
+        logger.warning("send_message failed (routing=%s): %s", routing, exc)
+        logging.getLogger("dialog").info(
+            "TG_SEND_FAIL chat_id=%s routing=%s exc=%s",
+            chat_id,
+            routing,
+            exc,
+        )
+        msg = await bot.send_message(
+            chat_id,
+            text,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+            **fallback_routing,
+        )
+        return msg, fallback_routing
 
 
 class MessageProgress:
@@ -275,30 +328,45 @@ async def main() -> None:
     bot = Bot(token=settings.telegram.token)
     dp = Dispatcher()
 
-    pending_topics: dict[int, tuple[int, float]] = {}
+    pending_topics: dict[int, tuple[dict[str, int], float]] = {}
 
-    def consume_pending_topic_id(chat_id: int) -> int | None:
+    def consume_pending_routing(chat_id: int) -> dict[str, int] | None:
         entry = pending_topics.get(chat_id)
         if not entry:
             return None
-        topic_id, ts = entry
+        routing, ts = entry
         if (time.monotonic() - ts) > _PENDING_TOPIC_TTL_S:
             pending_topics.pop(chat_id, None)
             return None
         pending_topics.pop(chat_id, None)
-        return int(topic_id)
+        return dict(routing)
 
     @dp.message(F.forum_topic_created)
     async def on_forum_topic_created(message: Message) -> None:
-        # В forum-чатах идентификатор топика совпадает с message_id сообщения "topic created".
-        topic_id = int(message.message_thread_id or message.message_id)
-        pending_topics[int(message.chat.id)] = (topic_id, time.monotonic())
+        routing: dict[str, int] = {}
+        topic_type = "unknown"
+        if message.message_thread_id is not None:
+            routing = {"message_thread_id": int(message.message_thread_id)}
+            topic_type = "forum"
+        else:
+            dm_tid = getattr(getattr(message, "direct_messages_topic", None), "topic_id", None)
+            if dm_tid is not None:
+                routing = {"direct_messages_topic_id": int(dm_tid)}
+                topic_type = "direct"
+
+        if routing:
+            pending_topics[int(message.chat.id)] = (routing, time.monotonic())
         dialog_logger.info(
-            "FORUM_TOPIC_CREATED chat_id=%s msg_id=%s message_thread_id=%s topic_id=%s title=%s",
+            (
+                "FORUM_TOPIC_CREATED chat_id=%s msg_id=%s message_thread_id=%s "
+                "dm_topic_id=%s topic_type=%s routing=%s title=%s"
+            ),
             message.chat.id,
             message.message_id,
             message.message_thread_id,
-            topic_id,
+            getattr(getattr(message, "direct_messages_topic", None), "topic_id", None),
+            topic_type,
+            routing,
             getattr(getattr(message, "forum_topic_created", None), "name", None),
         )
 
@@ -377,12 +445,13 @@ async def main() -> None:
 
     @dp.message(F.text)
     async def on_text(message: Message) -> None:
-        pending_topic_id = None
-        if topics_enabled and message.message_thread_id is None:
-            pending_topic_id = consume_pending_topic_id(int(message.chat.id))
+        pending_routing = None
+        if message.message_thread_id is None:
+            pending_routing = consume_pending_routing(int(message.chat.id))
 
-        thread_key, reply_kwargs = _topic_ctx(message, pending_topic_id=pending_topic_id)
+        thread_key, reply_kwargs = _topic_ctx(message, pending_routing=pending_routing)
         reply_kwargs = dict(reply_kwargs)
+        fallback_routing = {"reply_to_message_id": _reply_root_message_id(message)}
         # sendMessageDraft поддерживает только message_thread_id.
         use_drafts = bool(
             settings.telegram.enable_drafts
@@ -410,12 +479,24 @@ async def main() -> None:
         stop_typing = asyncio.Event()
         typing_task: asyncio.Task[None] | None = None
         if not use_drafts:
-            placeholder = await bot.send_message(
-                message.chat.id,
-                "Думаю…",
-                disable_web_page_preview=True,
-                **reply_kwargs,
-            )
+            # В некоторых режимах Telegram "угадывает" id топика не так, как мы.
+            # Если routing некорректен, падаем на безопасный reply.
+            try:
+                placeholder, used_routing = await _safe_send(
+                    bot,
+                    chat_id=cast(int, message.chat.id),
+                    text="Думаю…",
+                    routing=reply_kwargs,
+                    fallback_routing=fallback_routing,
+                    parse_mode=None,
+                )
+                if used_routing != reply_kwargs:
+                    reply_kwargs = dict(used_routing)
+                    if "reply_to_message_id" in used_routing:
+                        thread_key = int(used_routing["reply_to_message_id"])
+            except TelegramBadRequest:
+                # Если даже fallback не сработал — пусть исключение уйдёт в общий handler.
+                raise
 
             fallback_progress = MessageProgress(
                 placeholder,
@@ -492,30 +573,38 @@ async def main() -> None:
                 reply_md = to_telegram_markdown(reply)
                 parts_md = _split_text(reply_md)
                 if len(parts_md) > 1:
-                    await bot.send_message(
-                        message.chat.id,
-                        "Ответ слишком длинный — отправляю частями.",
-                        disable_web_page_preview=True,
-                        **reply_kwargs,
+                    _, used_routing = await _safe_send(
+                        bot,
+                        chat_id=cast(int, message.chat.id),
+                        text="Ответ слишком длинный — отправляю частями.",
+                        routing=reply_kwargs,
+                        fallback_routing=fallback_routing,
+                        parse_mode=None,
                     )
+                    reply_kwargs = dict(used_routing)
                 for part_md in parts_md:
-                    await bot.send_message(
-                        message.chat.id,
-                        part_md,
+                    _, used_routing = await _safe_send(
+                        bot,
+                        chat_id=cast(int, message.chat.id),
+                        text=part_md,
+                        routing=reply_kwargs,
+                        fallback_routing=fallback_routing,
                         parse_mode=ParseMode.MARKDOWN_V2,
-                        disable_web_page_preview=True,
-                        **reply_kwargs,
                     )
+                    reply_kwargs = dict(used_routing)
             except TelegramBadRequest:
                 # На всякий случай: если MarkdownV2 не отправился (лимиты/парсинг),
                 # отправляем plain-текст частями без разметки.
                 for part in _split_text(reply):
-                    await bot.send_message(
-                        message.chat.id,
-                        part,
-                        disable_web_page_preview=True,
-                        **reply_kwargs,
+                    _, used_routing = await _safe_send(
+                        bot,
+                        chat_id=cast(int, message.chat.id),
+                        text=part,
+                        routing=reply_kwargs,
+                        fallback_routing=fallback_routing,
+                        parse_mode=None,
                     )
+                    reply_kwargs = dict(used_routing)
 
             if placeholder:
                 with suppress(TelegramBadRequest):
@@ -525,21 +614,29 @@ async def main() -> None:
             if placeholder:
                 await placeholder.edit_text(f"Ошибка MCP: {exc}")
             else:
-                await bot.send_message(
-                    message.chat.id,
-                    f"Ошибка MCP: {exc}",
-                    **reply_kwargs,
+                _, used_routing = await _safe_send(
+                    bot,
+                    chat_id=cast(int, message.chat.id),
+                    text=f"Ошибка MCP: {exc}",
+                    routing=reply_kwargs,
+                    fallback_routing=fallback_routing,
+                    parse_mode=None,
                 )
+                reply_kwargs = dict(used_routing)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unhandled error")
             if placeholder:
                 await placeholder.edit_text(f"Ошибка: {exc}")
             else:
-                await bot.send_message(
-                    message.chat.id,
-                    f"Ошибка: {exc}",
-                    **reply_kwargs,
+                _, used_routing = await _safe_send(
+                    bot,
+                    chat_id=cast(int, message.chat.id),
+                    text=f"Ошибка: {exc}",
+                    routing=reply_kwargs,
+                    fallback_routing=fallback_routing,
+                    parse_mode=None,
                 )
+                reply_kwargs = dict(used_routing)
         finally:
             stop_typing.set()
             if typing_task:
