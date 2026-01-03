@@ -18,7 +18,7 @@ llm:
   title: Оценка рекрутеров
   provider_order: wandb/bf16,deepinfra/fp8,friendli
 sgr:
-  max_steps: 8
+  max_steps: 12
   max_items_per_search: 10
   temperature: 0.4
   history_messages: 10

@@ -44,7 +44,7 @@ class LLMConfig(BaseModel):
 
 
 class SgrConfig(BaseModel):
-    max_steps: int = 8
+    max_steps: int = 12
     max_items_per_search: int = 10
     temperature: float = 0.4
     history_messages: int = 8

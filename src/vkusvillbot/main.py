@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ParseMode
+from aiogram.enums import ChatAction, ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import Message
 
@@ -21,6 +23,63 @@ from vkusvillbot.sgr_agent import SgrAgent, SgrConfig
 from vkusvillbot.vector_index import FaissVectorIndex
 
 logger = logging.getLogger(__name__)
+
+
+_TG_MAX_LEN = 4096
+
+
+def _split_text(text: str, limit: int = _TG_MAX_LEN) -> list[str]:
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        if current and len(current) + len(line) > limit:
+            chunks.append(current)
+            current = line
+            continue
+        current += line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def _typing_loop(bot: Bot, chat_id: int, stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        with suppress(Exception):
+            await bot.send_chat_action(chat_id, ChatAction.TYPING)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=4.5)
+        except TimeoutError:
+            continue
+
+
+async def _pseudo_stream_plain(message: Message, text: str) -> None:
+    if not text:
+        return
+
+    # Чтобы не попасть в лимит длины + не спамить editMessageText.
+    preview = text.strip()
+    if len(preview) > 3500:
+        preview = preview[:3500].rstrip() + "\n…"
+
+    # 6–8 апдейтов дают ощущение «пишет», но не добавляют большую задержку.
+    max_updates = 8
+    step = max(200, len(preview) // max_updates)
+    last = 0
+    for i in range(step, len(preview) + step, step):
+        chunk = preview[:i]
+        if len(chunk) == last:
+            continue
+        last = len(chunk)
+        try:
+            await message.edit_text(chunk, parse_mode=None, disable_web_page_preview=True)
+        except TelegramBadRequest:
+            break
+        await asyncio.sleep(0.7)
 
 
 async def main() -> None:
@@ -111,6 +170,10 @@ async def main() -> None:
 
     @dp.message(F.text)
     async def on_text(message: Message) -> None:
+        placeholder = await message.answer("Думаю…", disable_web_page_preview=True)
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(_typing_loop(bot, message.chat.id, stop_typing))
+
         user = db.get_or_create_user(message.from_user.id)
         profile = UserProfile(city=user.city, diet_notes=user.diet_notes)
         agent = SgrAgent(
@@ -130,18 +193,50 @@ async def main() -> None:
             db.save_message(user.id, "assistant", reply)
             dialog_logger.info("ASSISTANT user_id=%s: %s", user.id, reply)
             db.save_session(user.id, "sgr", {"query": text})
-            reply_md = to_telegram_markdown(reply)
-            await message.answer(
-                reply_md,
-                parse_mode=ParseMode.MARKDOWN_V2,
-                disable_web_page_preview=True,
-            )
+
+            # Псевдостриминг: сначала «напечатаем» plain-текст, затем заменим на MarkdownV2.
+            if len(reply) >= 600:
+                await _pseudo_stream_plain(placeholder, reply)
+
+            parts = _split_text(reply)
+            if len(parts) == 1:
+                reply_md = to_telegram_markdown(reply)
+                await placeholder.edit_text(
+                    reply_md,
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    disable_web_page_preview=True,
+                )
+            else:
+                await placeholder.edit_text(
+                    "Ответ слишком длинный — отправляю частями.",
+                    parse_mode=None,
+                    disable_web_page_preview=True,
+                )
+                for i, part in enumerate(parts):
+                    part_md = to_telegram_markdown(part)
+                    if i == 0:
+                        await placeholder.edit_text(
+                            part_md,
+                            parse_mode=ParseMode.MARKDOWN_V2,
+                            disable_web_page_preview=True,
+                        )
+                    else:
+                        await message.answer(
+                            part_md,
+                            parse_mode=ParseMode.MARKDOWN_V2,
+                            disable_web_page_preview=True,
+                        )
         except MCPError as exc:
             logger.exception("MCP error")
-            await message.answer(f"Ошибка MCP: {exc}")
+            await placeholder.edit_text(f"Ошибка MCP: {exc}")
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unhandled error")
-            await message.answer(f"Ошибка: {exc}")
+            await placeholder.edit_text(f"Ошибка: {exc}")
+        finally:
+            stop_typing.set()
+            typing_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await typing_task
 
     try:
         await dp.start_polling(bot)

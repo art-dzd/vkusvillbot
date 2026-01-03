@@ -109,7 +109,7 @@ def compact_details(data: dict[str, Any]) -> dict[str, Any]:
 
 @dataclass
 class SgrConfig:
-    max_steps: int = 8
+    max_steps: int = 12
     max_items_per_search: int = 10
     temperature: float = 0.4
     history_messages: int = 8
@@ -140,6 +140,21 @@ class SgrAgent:
         history: list[dict[str, str]] | None = None,
         user_id: int | None = None,
     ) -> str:
+        async def render_final(final: FinalAnswer) -> str:
+            answer = final.answer
+            if final.cart_items and not final.cart_link:
+                try:
+                    cart_items = [item.model_dump() for item in final.cart_items]
+                    cart_data = await self.mcp.cart(cart_items)
+                    cart_link = cart_data.get("data", {}).get("link")
+                    if cart_link:
+                        answer = f"{answer}\n**Корзина:** [Открыть корзину]({cart_link})"
+                except MCPError as exc:
+                    answer = f"{answer}\nНе удалось создать корзину: {exc}"
+            if final.follow_up:
+                answer = f"{answer}\n{final.follow_up}"
+            return answer
+
         system_prompt = build_system_prompt(self.profile)
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
@@ -170,21 +185,7 @@ class SgrAgent:
             messages.append({"role": "assistant", "content": llm_text})
 
             if isinstance(parsed, FinalAnswer):
-                answer = parsed.answer
-                if parsed.cart_items and not parsed.cart_link:
-                    try:
-                        cart_items = [item.model_dump() for item in parsed.cart_items]
-                        cart_data = await self.mcp.cart(cart_items)
-                        cart_link = cart_data.get("data", {}).get("link")
-                        if cart_link:
-                            answer = (
-                                f"{answer}\n**Корзина:** [Открыть корзину]({cart_link})"
-                            )
-                    except MCPError as exc:
-                        answer = f"{answer}\nНе удалось создать корзину: {exc}"
-                if parsed.follow_up:
-                    answer = f"{answer}\n{parsed.follow_up}"
-                return answer
+                return await render_final(parsed)
 
             tool = parsed.tool
             args = parsed.args
@@ -312,6 +313,31 @@ class SgrAgent:
                     }
                 )
                 continue
+
+        # Фоллбек: последняя попытка сформировать final (без дополнительных tool_call).
+        try:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Лимит шагов исчерпан. Сформируй ОКОНЧАТЕЛЬНЫЙ ответ действием final. "
+                        "Запрещено вызывать инструменты. Верни строго JSON по схеме final."
+                    ),
+                }
+            )
+            llm_text = await self.llm.chat(messages, temperature=self.config.temperature)
+            if user_id is not None:
+                dialog_logger.info("LLM_RAW user_id=%s step=%s: %s", user_id, "grace", llm_text)
+            try:
+                parsed = parse_llm_output(llm_text)
+            except (ValueError, ValidationError) as exc:
+                logger.warning("Grace LLM output parse error: %s", exc)
+            else:
+                messages.append({"role": "assistant", "content": llm_text})
+                if isinstance(parsed, FinalAnswer):
+                    return await render_final(parsed)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Grace final attempt failed: %s", exc)
 
         return "Не успел завершить запрос. Попробуйте уточнить или повторить."
 
