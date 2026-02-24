@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+log() {
+  echo "[pre-commit] $*"
+}
+
+warn() {
+  echo "[pre-commit][skip] $*"
+}
+
+run_if_available() {
+  local tool="$1"
+  shift
+
+  local local_candidate="$REPO_ROOT/.venv/bin/$tool"
+  local npm_candidate="$REPO_ROOT/node_modules/.bin/$tool"
+
+  local runner=""
+  if [ -x "$local_candidate" ]; then
+    runner="$local_candidate"
+  elif [ -x "$npm_candidate" ]; then
+    runner="$npm_candidate"
+  elif command -v "$tool" >/dev/null 2>&1; then
+    runner="$tool"
+  else
+    return 1
+  fi
+
+  log "Running: $runner $*"
+  "$runner" "$@"
+}
+
+FAILED=0
+
+if ! run_if_available ruff check .; then
+  warn "ruff недоступен"
+  FAILED=1
+fi
+
+if ! run_if_available mypy src; then
+  warn "mypy недоступен, пропуск"
+fi
+
+if ! run_if_available pytest; then
+  warn "pytest недоступен, пропуск"
+fi
+
+if [ -f "package.json" ]; then
+  if ! run_if_available eslint .; then
+    warn "eslint недоступен, пропуск"
+  fi
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+  log "Некоторые обязательные проверки не запущены (не установлен ruff)"
+  exit 1
+fi
