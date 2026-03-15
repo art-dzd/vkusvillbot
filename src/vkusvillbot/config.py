@@ -16,6 +16,7 @@ class AppConfig(BaseModel):
 class TelegramConfig(BaseModel):
     bot_username: str = ""
     token: str = Field(default="", repr=False)
+    proxy_url: str | None = Field(default=None, repr=False)
     enable_drafts: bool = True
     show_progress: bool = True
 
@@ -76,6 +77,9 @@ class Settings(BaseModel):
         token = os.getenv("TELEGRAM_BOT_TOKEN")
         if token:
             telegram["token"] = token
+        telegram_proxy = os.getenv("TELEGRAM_PROXY_URL")
+        if telegram_proxy:
+            telegram["proxy_url"] = telegram_proxy
         data["telegram"] = telegram
 
         db = data.get("db", {})

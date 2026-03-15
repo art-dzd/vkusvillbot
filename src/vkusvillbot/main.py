@@ -7,6 +7,7 @@ from contextlib import suppress
 from typing import cast
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
@@ -276,7 +277,7 @@ async def main() -> None:
     if not settings.telegram.token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
 
-    tg_api = TelegramAPI(settings.telegram.token)
+    tg_api = TelegramAPI(settings.telegram.token, proxy_url=settings.telegram.proxy_url)
     topics_enabled = False
     try:
         me = await tg_api.get_me()
@@ -325,7 +326,7 @@ async def main() -> None:
         use_mcp_refresh=settings.sgr.use_mcp_refresh,
     )
 
-    bot = Bot(token=settings.telegram.token)
+    bot = Bot(token=settings.telegram.token, session=AiohttpSession(proxy=settings.telegram.proxy_url or None))
     dp = Dispatcher()
 
     pending_topics: dict[int, tuple[dict[str, int], float]] = {}

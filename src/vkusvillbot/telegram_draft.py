@@ -17,16 +17,18 @@ class TelegramAPI:
         token: str,
         *,
         endpoint: str = "https://api.telegram.org",
+        proxy_url: str | None = None,
         timeout: float = 10.0,
     ) -> None:
         if not token:
             raise TelegramAPIError("Пустой токен Telegram")
         self._base_url = f"{endpoint}/bot{token}"
+        self._proxy_url = proxy_url
         self._timeout = timeout
 
     async def call(self, method: str, payload: dict[str, Any]) -> Any:
         url = f"{self._base_url}/{method}"
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        async with httpx.AsyncClient(proxy=self._proxy_url, timeout=self._timeout) as client:
             resp = await client.post(url, json=payload)
 
         if resp.status_code >= 400:
