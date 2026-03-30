@@ -22,7 +22,7 @@ python -m vkusvillbot.main
 ```bash
 docker compose up --build
 ```
-Текущий `docker-compose.yml` запускает бота через `watchfiles`, поэтому изменения Python-кода подхватываются автоматически.
+Текущий `docker-compose.yml` запускает бота через `watchfiles` (dev-режим), поэтому изменения Python-кода подхватываются автоматически. В продакшене (Dockerfile) бот запускается напрямую без `watchfiles`.
 
 ## Автодеплой на macmini
 Workflow: `.github/workflows/deploy-macmini.yml`.
@@ -32,7 +32,7 @@ Runner labels: `self-hosted`, `macmini`, `vkusvillbot`.
 Сценарий деплоя (`scripts/deploy_macmini.sh`):
 1. `git fetch --all --prune`
 2. `git reset --hard origin/main`
-3. `git clean -ffdx` (с исключениями `.env`, `data`, `logs`)
+3. `git clean -ffdx` — если `.env` существует, он исключается из очистки (`-e .env -e data -e logs`); если `.env` отсутствует, выводится `WARNING: .env not found in repo dir`.
 4. `docker compose up -d --build`
 5. `docker compose ps`
 

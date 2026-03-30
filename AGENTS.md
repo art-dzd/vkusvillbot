@@ -23,12 +23,26 @@
 5. Ошибки должны быть видимы в логах, без "тихих" падений.
 
 ## Каноническая документация
+
+### Архитектура и дизайн
 - `docs/architecture.md` — компоненты, слои и потоки данных.
+- `docs/design/sgr-loop.md` — внутренний контракт SGR-цикла.
+- `docs/design/local-retrieval.md` — дизайн локального semantic search.
+
+### Операции
 - `docs/deploy.md` — запуск, автодеплой, rollback и post-check.
 - `docs/testing.md` — quality gate и текущая тестовая стратегия.
 - `docs/commands.md` — команды разработки и эксплуатации.
-- `docs/design/sgr-loop.md` — внутренний контракт SGR-цикла.
-- `docs/design/local-retrieval.md` — дизайн локального semantic search.
+
+### Аудиты и ревью (2026-03-20)
+- `docs/quality-score.md` — сводная оценка проекта: 5.9/10.
+- `docs/code-review.md` — 25 находок (4 CRITICAL, 8 HIGH). Оценка: 5/10.
+- `docs/architecture-review.md` — 7 критериев, средняя: 5.6/10.
+- `docs/security-review.md` — 25 находок (1 CRITICAL, 8 HIGH).
+- `docs/simplifier-report.md` — 15 находок, ~250 строк потенциальной экономии.
+- `docs/test-gaps.md` — 7 тестов на 16 модулей, приоритетный план покрытия.
+- `docs/dependency-audit.md` — 13 зависимостей, 1 неиспользуемая, CVE-статус.
+- `docs/ci-review.md` — CI/CD pipeline: 3.2/10 (нет CI-проверок, только CD).
 
 ## Ограничения
 - Без `OPENROUTER_API_KEY` не работают LLM и embeddings.

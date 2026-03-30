@@ -13,7 +13,7 @@
 - `tests/test_config.py` — приоритет env-переменных над `config.yaml`.
 - `tests/test_sgr_parser.py` — парсинг LLM-JSON (`tool_call`/`final`) и обработка "шумного" текста.
 - `tests/test_vector_search.py` — фильтрация/сортировка nutrition и semantic retrieval через FAISS.
-- `tests/test_message_threads.py` — корректная миграция `thread_id` и изоляция истории по тредам.
+- `tests/test_message_threads.py` — корректная инициализация `thread_id` и изоляция истории по тредам.
 
 ## Локальный pre-commit
 `.githooks/pre-commit` запускает:

@@ -34,6 +34,13 @@ docker compose logs --tail=200 bot
 python scripts/build_vector_index.py
 python scripts/build_vector_index.py --force --batch-size 64
 ```
+Доступные параметры:
+- `--db` — путь к SQLite-базе (по умолчанию из конфига);
+- `--index` — путь к FAISS-индексу (по умолчанию из конфига);
+- `--model` — модель эмбеддингов (по умолчанию из конфига);
+- `--batch-size` — размер батча (по умолчанию 48);
+- `--sleep` — задержка между батчами в секундах (по умолчанию 0.2);
+- `--force` — пересоздать все эмбеддинги, игнорируя `content_hash`.
 
 Ручная отладка SGR-цикла:
 ```bash

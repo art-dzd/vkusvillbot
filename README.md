@@ -62,6 +62,7 @@ Workflow вызывает скрипт `scripts/deploy_macmini.sh`, которы
   - `TELEGRAM_BOT_TOKEN`
   - `OPENROUTER_API_KEY`
   - `OPENROUTER_PROXY_URL`
+  - `OPENROUTER_EMBEDDING_MODEL` (модель для эмбеддингов, переопределяет значение из `config.yaml`)
 - `config.yaml` — настройки:
   - URL MCP-сервера
   - параметры SGR
@@ -71,9 +72,21 @@ Workflow вызывает скрипт `scripts/deploy_macmini.sh`, которы
 
 ## Структура проекта
 
-- `src/vkusvillbot/main.py` — входная точка Telegram-бота.
-- `src/vkusvillbot/sgr_agent.py` — SGR-цикл и вызовы MCP.
-- `src/vkusvillbot/llm_client.py` — клиент OpenRouter (с прокси).
+- `src/vkusvillbot/main.py` — входная точка Telegram-бота, диспетчер aiogram.
+- `src/vkusvillbot/sgr_agent.py` — SGR-цикл и вызовы MCP/локальных инструментов.
+- `src/vkusvillbot/llm_client.py` — клиент OpenRouter (chat-completions).
+- `src/vkusvillbot/embeddings_client.py` — клиент OpenRouter (embeddings).
+- `src/vkusvillbot/mcp_client.py` — обёртка MCP ВкусВилл.
 - `src/vkusvillbot/prompts.py` — системный промпт LLM.
+- `src/vkusvillbot/product_retriever.py` — FAISS-семантика + FTS5 + фильтры.
+- `src/vkusvillbot/vector_index.py` — FAISS-индекс.
+- `src/vkusvillbot/db.py` — SQLite-слой.
+- `src/vkusvillbot/config.py` — конфигурация.
+- `src/vkusvillbot/models.py` — dataclass-модели (`UserProfile`).
+- `src/vkusvillbot/formatting.py` — Markdown → MarkdownV2 для Telegram.
+- `src/vkusvillbot/telegram_draft.py` — Telegram Bot API drafts.
+- `src/vkusvillbot/logging.py` — настройка логирования.
+- `src/vkusvillbot/manual_llm.py` — интерактивный LLM для отладки.
 - `scripts/manual_sgr.py` — ручная отладка SGR.
+- `scripts/build_vector_index.py` — сборка FAISS-индекса.
 - `tests/` — тесты.
