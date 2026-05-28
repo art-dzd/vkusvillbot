@@ -13,22 +13,23 @@ jobs:
         run: |
           set -euo pipefail
 
-          exec 200>/tmp/vkusvillbot-gitea-deploy.lock
-          flock -w 300 200
+          /usr/bin/lockf -t 300 /tmp/vkusvillbot-gitea-deploy.lock /bin/bash -lc '
+            set -euo pipefail
 
-          cd /Users/macmini/dev-server/vkusvillbot
-          bash scripts/deploy_macmini.sh
+            cd /Users/macmini/dev-server/vkusvillbot
+            bash scripts/deploy_macmini.sh
 
-          docker compose ps
-          BOT_CID="$(docker compose ps -q bot)"
-          if [ -z "$BOT_CID" ]; then
-            echo "bot container is not running"
-            exit 1
-          fi
+            docker compose ps
+            BOT_CID="$(docker compose ps -q bot)"
+            if [ -z "$BOT_CID" ]; then
+              echo "bot container is not running"
+              exit 1
+            fi
 
-          BOT_STATUS="$(docker inspect -f '{{.State.Status}}' "$BOT_CID")"
-          echo "bot=${BOT_STATUS}"
-          test "$BOT_STATUS" = "running"
+            BOT_STATUS="$(docker inspect -f "{{.State.Status}}" "$BOT_CID")"
+            echo "bot=${BOT_STATUS}"
+            test "$BOT_STATUS" = "running"
+          '
 
       - name: Docker logs on failure
         if: failure()
